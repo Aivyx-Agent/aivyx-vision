@@ -39,6 +39,22 @@ pub enum SvgGenerationError {
     Sanitization(String),
 }
 
+/// Pull the `<svg>...</svg>` block out of an arbitrary completion
+/// response. Finds the first `<svg` and the last `</svg>` in the whole
+/// response and slices between them (inclusive) -- this tolerates a
+/// markdown code fence or explanatory prose around the block without
+/// needing to parse or strip the fence syntax explicitly. Returns `None`
+/// if no `<svg`/`</svg>` pair is present, or if the `</svg>` found is
+/// before the `<svg` found (malformed / truncated response).
+fn extract_svg_markup(response: &str) -> Option<&str> {
+    let start = response.find("<svg")?;
+    let end = response.rfind("</svg>")? + "</svg>".len();
+    if end <= start {
+        return None;
+    }
+    Some(&response[start..end])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,5 +107,29 @@ mod tests {
         let completer: &dyn TextCompleter = &fake;
         let err = completer.complete("prompt").await.unwrap_err();
         assert_eq!(err.0, "backend down");
+    }
+
+    #[test]
+    fn extract_svg_markup_finds_a_bare_svg_block() {
+        let response = "<svg xmlns=\"http://www.w3.org/2000/svg\"><circle r=\"5\"/></svg>";
+        assert_eq!(extract_svg_markup(response), Some(response));
+    }
+
+    #[test]
+    fn extract_svg_markup_strips_a_surrounding_markdown_fence() {
+        let response = "Here you go:\n```svg\n<svg><rect/></svg>\n```\nEnjoy!";
+        assert_eq!(extract_svg_markup(response), Some("<svg><rect/></svg>"));
+    }
+
+    #[test]
+    fn extract_svg_markup_returns_none_when_no_svg_tag_present() {
+        let response = "I can't generate images.";
+        assert_eq!(extract_svg_markup(response), None);
+    }
+
+    #[test]
+    fn extract_svg_markup_returns_none_for_an_unclosed_svg_tag() {
+        let response = "<svg><circle r=\"5\"/>";
+        assert_eq!(extract_svg_markup(response), None);
     }
 }
