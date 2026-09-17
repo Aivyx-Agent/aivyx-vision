@@ -46,6 +46,9 @@ pub enum SvgGenerationError {
 /// needing to parse or strip the fence syntax explicitly. Returns `None`
 /// if no `<svg`/`</svg>` pair is present, or if the `</svg>` found is
 /// before the `<svg` found (malformed / truncated response).
+#[allow(dead_code)]
+// Called by Task 4's generate_svg; until then, only test code uses it.
+// Suppressed here so this commit doesn't leave the crate failing clippy.
 fn extract_svg_markup(response: &str) -> Option<&str> {
     let start = response.find("<svg")?;
     let end = response.rfind("</svg>")? + "</svg>".len();
