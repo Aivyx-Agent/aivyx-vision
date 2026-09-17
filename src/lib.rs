@@ -46,9 +46,6 @@ pub enum SvgGenerationError {
 /// needing to parse or strip the fence syntax explicitly. Returns `None`
 /// if no `<svg`/`</svg>` pair is present, or if the `</svg>` found is
 /// before the `<svg` found (malformed / truncated response).
-#[allow(dead_code)]
-// Called by Task 4's generate_svg; until then, only test code uses it.
-// Suppressed here so this commit doesn't leave the crate failing clippy.
 fn extract_svg_markup(response: &str) -> Option<&str> {
     let start = response.find("<svg")?;
     let end = response.rfind("</svg>")? + "</svg>".len();
@@ -56,6 +53,47 @@ fn extract_svg_markup(response: &str) -> Option<&str> {
         return None;
     }
     Some(&response[start..end])
+}
+
+use svg_hush::{Filter, data_url_filter};
+
+const SYSTEM_PROMPT: &str = "\
+You are generating a single, self-contained SVG image for the request \
+below. Respond with ONLY the SVG markup, starting with `<svg` and ending \
+with `</svg>`. Do not include any explanation, and do not reference any \
+external file, URL, font, or resource -- everything must be inline \
+within the SVG itself.\n\nRequest: ";
+
+/// Prompt `completer` for an SVG matching `user_prompt`, extract the SVG
+/// markup from its response, sanitize it (strip scripting and external
+/// references via `svg-hush`), and return the clean SVG source. This is
+/// the crate's one public entry point.
+pub async fn generate_svg(
+    completer: &dyn TextCompleter,
+    user_prompt: &str,
+) -> Result<String, SvgGenerationError> {
+    let full_prompt = format!("{SYSTEM_PROMPT}{user_prompt}");
+    let raw = completer.complete(&full_prompt).await?;
+    let extracted = extract_svg_markup(&raw).ok_or(SvgGenerationError::NoSvgFound)?;
+    sanitize_svg(extracted)
+}
+
+/// Run `svg` through `svg-hush`'s allowlist-based filter: strips
+/// `<script>`, `on*` event-handler attributes, and cross-origin resource
+/// references before this content is ever returned to a caller -- SVG is
+/// executable-ish content (it can embed scripts in a browser-rendering
+/// context), so this is load-bearing, not optional polish. Also rejects
+/// any `data:` URL that isn't a standard inline image, via
+/// `data_url_filter::allow_standard_images`, rather than allowing
+/// arbitrary `data:` schemes through unchecked.
+fn sanitize_svg(svg: &str) -> Result<String, SvgGenerationError> {
+    let mut filter = Filter::new();
+    filter.set_data_url_filter(data_url_filter::allow_standard_images);
+    let mut out = Vec::new();
+    filter
+        .filter(&mut svg.as_bytes(), &mut out)
+        .map_err(|e| SvgGenerationError::Sanitization(e.to_string()))?;
+    String::from_utf8(out).map_err(|e| SvgGenerationError::Sanitization(e.to_string()))
 }
 
 #[cfg(test)]
@@ -134,5 +172,59 @@ mod tests {
     fn extract_svg_markup_returns_none_for_an_unclosed_svg_tag() {
         let response = "<svg><circle r=\"5\"/>";
         assert_eq!(extract_svg_markup(response), None);
+    }
+
+    #[tokio::test]
+    async fn generate_svg_returns_clean_svg_from_a_fenced_response() {
+        let fake = FakeCompleter::returning(Ok(
+            "```svg\n<svg xmlns=\"http://www.w3.org/2000/svg\"><circle r=\"5\"/></svg>\n```"
+                .to_string(),
+        ));
+        let svg = generate_svg(&fake, "a small red circle").await.unwrap();
+        assert!(svg.contains("<svg"));
+        assert!(svg.contains("<circle"));
+        assert!(!svg.contains("```"));
+    }
+
+    #[tokio::test]
+    async fn generate_svg_sends_the_user_prompt_to_the_completer() {
+        let fake = FakeCompleter::returning(Ok(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>".to_string()
+        ));
+        generate_svg(&fake, "a purple hexagon icon").await.unwrap();
+        let sent = fake.captured_prompt.lock().unwrap().clone().unwrap();
+        assert!(sent.contains("a purple hexagon icon"));
+    }
+
+    #[tokio::test]
+    async fn generate_svg_errors_when_no_svg_is_present() {
+        let fake = FakeCompleter::returning(Ok("I can't draw that.".to_string()));
+        let err = generate_svg(&fake, "anything").await.unwrap_err();
+        assert!(matches!(err, SvgGenerationError::NoSvgFound));
+    }
+
+    #[tokio::test]
+    async fn generate_svg_propagates_completer_errors() {
+        let fake = FakeCompleter::returning(Err(TextCompleterError("timed out".into())));
+        let err = generate_svg(&fake, "anything").await.unwrap_err();
+        assert!(matches!(err, SvgGenerationError::Completion(_)));
+    }
+
+    #[tokio::test]
+    async fn generate_svg_strips_a_script_tag() {
+        let fake = FakeCompleter::returning(Ok(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script>\
+             <circle r=\"5\"/></svg>"
+                .to_string(),
+        ));
+        let svg = generate_svg(&fake, "a circle").await.unwrap();
+        assert!(
+            !svg.to_lowercase().contains("script"),
+            "sanitizer must strip <script> entirely, got: {svg}"
+        );
+        assert!(
+            svg.contains("circle"),
+            "sanitizer must keep the safe content"
+        );
     }
 }
