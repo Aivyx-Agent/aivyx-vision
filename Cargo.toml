@@ -1,0 +1,14 @@
+[package]
+name = "aivyx-vision-svg"
+description = "LLM-prompted SVG generation, sanitized before return -- the vector/graphic-design slice of the Aivyx-Vision toolset"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+async-trait = "0.1.89"
+svg-hush = "0.9.7"
+thiserror = "2.0.18"
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["macros", "rt"] }
