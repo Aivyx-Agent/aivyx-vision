@@ -68,24 +68,47 @@ impl MoldProvider {
 
 #[async_trait]
 impl GenerationProvider for MoldProvider {
+    /// Detached from the caller's own future on purpose -- see this
+    /// module's top-level doc comment (or the design rationale in
+    /// `docs/superpowers/plans/2026-09-19-gpu-lock-cancellation-safety.md`
+    /// if that's been pruned) for why a `Drop`-based release guard would
+    /// have been the *wrong* fix: releasing the lock the instant the
+    /// caller's future is dropped could free it before `mold serve` has
+    /// actually finished the in-flight generation, letting a second
+    /// caller start a second GPU job while the first is still running.
+    /// Spawning the whole `acquire -> generate -> release -> write`
+    /// sequence and only `.await`ing the `JoinHandle` here means a
+    /// cancelled caller abandons *waiting on the result*, never the
+    /// operation itself -- the lock is only ever released after
+    /// generation has genuinely finished, cancelled or not.
     async fn generate_image(&self, req: ImageRequest) -> Result<GeneratedAsset, VisionError> {
-        let lease = self.gpu_lock.acquire().await.map_err(map_gpu_lock_error)?;
+        let gpu_lock = self.gpu_lock.clone();
+        let mold = self.mold.clone();
+        let output_dir = self.output_dir.clone();
 
-        let mold_req = build_mold_request(&req);
-        let result = match mold_req {
-            Ok(mold_req) => self.mold.generate(mold_req).await.map_err(map_mold_error),
-            Err(e) => Err(e),
-        };
+        let handle = tokio::spawn(async move {
+            let lease = gpu_lock.acquire().await.map_err(map_gpu_lock_error)?;
 
-        if let Err(e) = self.gpu_lock.release(&lease).await {
-            tracing::warn!(
-                error = %e,
-                "gpu-lock release failed after generation; aivyx-broker's reap_expired will eventually reclaim it"
-            );
-        }
+            let mold_req = build_mold_request(&req);
+            let result = match mold_req {
+                Ok(mold_req) => mold.generate(mold_req).await.map_err(map_mold_error),
+                Err(e) => Err(e),
+            };
 
-        let response = result?;
-        write_generated_asset(&self.output_dir, response)
+            if let Err(e) = gpu_lock.release(&lease).await {
+                tracing::warn!(
+                    error = %e,
+                    "gpu-lock release failed after generation; aivyx-broker's reap_expired will eventually reclaim it"
+                );
+            }
+
+            let response = result?;
+            write_generated_asset(&output_dir, response)
+        });
+
+        handle.await.map_err(|e| {
+            VisionError::BackendUnreachable(format!("generation task panicked: {e}"))
+        })?
     }
 
     async fn generate_3d(&self, _req: ThreeDRequest) -> Result<GeneratedAsset, VisionError> {
@@ -399,6 +422,59 @@ mod tests {
         };
         let err = build_mold_request(&req).unwrap_err();
         assert!(matches!(err, VisionError::Io(_)));
+    }
+
+    #[tokio::test]
+    async fn generate_image_releases_the_lease_even_when_the_caller_cancels_mid_generation() {
+        let broker = MockServer::start().await;
+        let mold = MockServer::start().await;
+        let output_dir = tempfile::tempdir().unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/gpu-lock/acquire"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"lease_id": "l-cancel"})),
+            )
+            .mount(&broker)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/gpu-lock/release"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&broker)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(150))
+                    .set_body_bytes(vec![9, 9, 9])
+                    .insert_header("content-type", "image/png"),
+            )
+            .mount(&mold)
+            .await;
+
+        let provider = test_provider(&broker, &mold, output_dir.path().to_path_buf()).await;
+
+        // Simulates a real caller losing interest mid-generation (a timeout
+        // wrapper, tokio::select!, a shutdown signal, ...): spawn the call on
+        // its own task, then abort *that outer task* -- not anything inside
+        // generate_image itself -- while mold's response is still delayed.
+        let outer =
+            tokio::spawn(async move { provider.generate_image(sample_image_request()).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        outer.abort();
+
+        // Give generate_image's own internally-spawned task (independent of
+        // the outer task we just aborted) time to run past mold's artificial
+        // delay and release the lock for real.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // The release mock's `.expect(1)` above is checked here, explicitly --
+        // this is the whole point of the test: release must still happen even
+        // though nothing is left awaiting generate_image's own result.
+        broker.verify().await;
     }
 
     #[test]

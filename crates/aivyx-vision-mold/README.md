@@ -61,3 +61,11 @@ fall back to `bin`).
 - **`MOLD_READ_TIMEOUT` (300s) is a fixed constant, not yet
   configurable** via `MoldConfig` — generous enough for realistic local
   FLUX/SDXL generation time, but a v1 simplification.
+- **Cancelling the caller's own future doesn't cancel the underlying GPU
+  work or skip releasing the lock.** `generate_image` runs its
+  `acquire -> generate -> release -> write` sequence on an internally
+  spawned task; if the calling future is dropped (a timeout, a
+  `tokio::select!`, a shutdown signal), that task keeps running to real
+  completion regardless -- the lock is only ever released after
+  generation genuinely finishes, never early. A cancelled call still
+  costs real GPU time server-side; the caller just never sees the result.
