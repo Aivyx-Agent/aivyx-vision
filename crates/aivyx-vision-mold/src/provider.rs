@@ -50,9 +50,17 @@ impl MoldProvider {
                 VisionError::BackendUnreachable(format!("failed to build HTTP client: {e}"))
             })?;
 
+        // Trimmed here, once, rather than at each of the three `format!`
+        // call sites inside `mold_client.rs`/`gpu_lock_client.rs` -- a
+        // trailing slash on either configured URL would otherwise produce
+        // a double-slash request path (e.g. `.../api/generate` becoming
+        // `..//api/generate`), which may not route correctly.
+        let mold_url = config.mold_url.trim_end_matches('/').to_string();
+        let broker_url = config.broker_url.trim_end_matches('/').to_string();
+
         Ok(Self {
-            gpu_lock: GpuLockClient::new(http.clone(), config.broker_url),
-            mold: MoldClient::new(http, config.mold_url, config.api_key),
+            gpu_lock: GpuLockClient::new(http.clone(), broker_url),
+            mold: MoldClient::new(http, mold_url, config.api_key),
             output_dir: config.output_dir,
         })
     }
@@ -159,6 +167,7 @@ fn map_mold_error(e: MoldClientError) -> VisionError {
         MoldClientError::Transport(msg) => {
             VisionError::BackendUnreachable(format!("mold serve: {msg}"))
         }
+        MoldClientError::Timeout => VisionError::GenerationTimeout,
         MoldClientError::ModelNotFound(msg) => VisionError::BackendError {
             status: 404,
             code: Some("MODEL_NOT_FOUND".to_string()),

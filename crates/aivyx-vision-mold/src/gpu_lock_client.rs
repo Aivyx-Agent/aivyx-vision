@@ -39,6 +39,19 @@ pub struct GpuLockClient {
     broker_url: String,
 }
 
+/// Classifies a `reqwest::Error` from a broker request. A *connect*
+/// timeout means the broker genuinely isn't reachable, so it stays
+/// `Transport`; a timeout during the request/response itself maps to the
+/// existing `Timeout` variant -- the same distinction `mold_client.rs`'s
+/// `classify_transport_error` makes for `mold serve` requests.
+fn classify_transport_error(e: reqwest::Error) -> GpuLockClientError {
+    if e.is_timeout() && !e.is_connect() {
+        GpuLockClientError::Timeout
+    } else {
+        GpuLockClientError::Transport(e.to_string())
+    }
+}
+
 impl GpuLockClient {
     pub fn new(http: reqwest::Client, broker_url: String) -> Self {
         Self { http, broker_url }
@@ -50,7 +63,7 @@ impl GpuLockClient {
             .post(format!("{}/gpu-lock/acquire", self.broker_url))
             .send()
             .await
-            .map_err(|e| GpuLockClientError::Transport(e.to_string()))?;
+            .map_err(classify_transport_error)?;
 
         if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
             return Err(GpuLockClientError::Timeout);
@@ -177,5 +190,27 @@ mod tests {
         let client = GpuLockClient::new(reqwest::Client::new(), "http://127.0.0.1:1".to_string());
         let err = client.acquire().await.unwrap_err();
         assert!(matches!(err, GpuLockClientError::Transport(_)));
+    }
+
+    #[tokio::test]
+    async fn acquire_returns_timeout_when_the_broker_response_stalls_past_the_client_timeout() {
+        let broker = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/gpu-lock/acquire"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"lease_id": "l-slow"}))
+                    .set_delay(std::time::Duration::from_millis(200)),
+            )
+            .mount(&broker)
+            .await;
+
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let client = GpuLockClient::new(http, broker.uri());
+        let err = client.acquire().await.unwrap_err();
+        assert!(matches!(err, GpuLockClientError::Timeout));
     }
 }

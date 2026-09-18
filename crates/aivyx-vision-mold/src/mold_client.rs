@@ -45,6 +45,8 @@ pub struct GenerateImageResponse {
 pub enum MoldClientError {
     #[error("could not reach mold serve: {0}")]
     Transport(String),
+    #[error("generation timed out")]
+    Timeout,
     #[error("model not found: {0}")]
     ModelNotFound(String),
     #[error("mold serve's own generation queue is full")]
@@ -55,6 +57,21 @@ pub enum MoldClientError {
         code: Option<String>,
         message: String,
     },
+}
+
+/// Classifies a `reqwest::Error` from a mold serve request. A *connect*
+/// timeout means the backend genuinely isn't reachable, so it stays
+/// `Transport`; a timeout during the request/response itself (most
+/// realistically `.bytes().await` stalling on a slow generation, since
+/// `MoldProvider::new` sets a long `read_timeout` for exactly that case)
+/// means the backend is reachable but generation didn't finish in time,
+/// which is a distinct, separately-actionable failure.
+fn classify_transport_error(e: reqwest::Error) -> MoldClientError {
+    if e.is_timeout() && !e.is_connect() {
+        MoldClientError::Timeout
+    } else {
+        MoldClientError::Transport(e.to_string())
+    }
 }
 
 #[derive(Clone)]
@@ -84,10 +101,7 @@ impl MoldClient {
         if let Some(key) = &self.api_key {
             builder = builder.header("X-Api-Key", key);
         }
-        let response = builder
-            .send()
-            .await
-            .map_err(|e| MoldClientError::Transport(e.to_string()))?;
+        let response = builder.send().await.map_err(classify_transport_error)?;
 
         let status = response.status();
         if status.is_success() {
@@ -105,7 +119,7 @@ impl MoldClient {
             let bytes = response
                 .bytes()
                 .await
-                .map_err(|e| MoldClientError::Transport(e.to_string()))?
+                .map_err(classify_transport_error)?
                 .to_vec();
             return Ok(GenerateImageResponse {
                 bytes,
@@ -286,5 +300,34 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, MoldClientError::Transport(_)));
+    }
+
+    #[tokio::test]
+    async fn generate_returns_timeout_when_the_response_body_stalls_past_the_client_timeout() {
+        let mold = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(vec![1, 2, 3])
+                    .insert_header("content-type", "image/png")
+                    .set_delay(std::time::Duration::from_millis(200)),
+            )
+            .mount(&mold)
+            .await;
+
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let client = MoldClient::new(http, mold.uri(), None);
+        let err = client
+            .generate(GenerateImageRequest {
+                prompt: "anything".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MoldClientError::Timeout));
     }
 }
