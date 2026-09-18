@@ -43,9 +43,13 @@ Single file, `src/lib.rs`:
   product. A consuming product's adapter implements this trait by
   delegating to its own real provider.
 - `extract_svg_markup` — pure function, no I/O. Finds the first `<svg`
-  and last `</svg>` in a raw completion response and slices between them,
-  tolerating a markdown code fence or surrounding prose without needing
-  to parse the fence syntax explicitly.
+  and last `</svg>` in a raw completion response and slices between them.
+  This tolerates a markdown code fence around the block, and prose that
+  doesn't itself mention `<svg>` before the real block; a response that
+  mentions `<svg` in prose ahead of the actual fenced block will fail
+  sanitization with an XML-parsing error rather than being correctly
+  extracted — a known, accepted limitation, not silently wrong (it fails
+  closed, never emits a truncated or wrong block).
 - `sanitize_svg` — wraps the `svg-hush` crate's allowlist-based filter.
   **Load-bearing, not optional**: SVG is executable-ish content, and this
   is the only thing standing between a model's raw output and whatever

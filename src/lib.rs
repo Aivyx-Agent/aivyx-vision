@@ -3,8 +3,8 @@
 //! 2026-09-18-aivyx-vision-v1-design.md`) -- the vector/graphic-design
 //! milestone, which deliberately needs no image/3D generation engine at
 //! all: it prompts the *caller's own already-configured* text-completion
-//! backend (see `TextCompleter`, added in a later commit) and sanitizes
-//! whatever SVG markup comes back.
+//! backend (see `TextCompleter`) and sanitizes whatever SVG markup comes
+//! back.
 
 use async_trait::async_trait;
 use svg_hush::{Filter, data_url_filter};
@@ -31,6 +31,7 @@ pub struct TextCompleterError(pub String);
 
 /// Everything that can go wrong generating an SVG.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SvgGenerationError {
     #[error(transparent)]
     Completion(#[from] TextCompleterError),
@@ -42,11 +43,15 @@ pub enum SvgGenerationError {
 
 /// Pull the `<svg>...</svg>` block out of an arbitrary completion
 /// response. Finds the first `<svg` and the last `</svg>` in the whole
-/// response and slices between them (inclusive) -- this tolerates a
-/// markdown code fence or explanatory prose around the block without
-/// needing to parse or strip the fence syntax explicitly. Returns `None`
-/// if no `<svg`/`</svg>` pair is present, or if the `</svg>` found is
-/// before the `<svg` found (malformed / truncated response).
+/// response and slices between them (inclusive). This tolerates a
+/// markdown code fence around the block, and prose that doesn't itself
+/// mention `<svg>` before the real block. A response that mentions `<svg`
+/// in prose ahead of the actual fenced block will fail sanitization with
+/// an XML-parsing error rather than being correctly extracted -- a known,
+/// accepted limitation, not silently wrong (it fails closed, never emits
+/// a truncated or wrong block). Returns `None` if no `<svg`/`</svg>` pair
+/// is present, or if the `</svg>` found is before the `<svg` found
+/// (malformed / truncated response).
 fn extract_svg_markup(response: &str) -> Option<&str> {
     let start = response.find("<svg")?;
     let end = response.rfind("</svg>")? + "</svg>".len();
@@ -86,10 +91,15 @@ pub async fn generate_svg(
 }
 
 /// Run `svg` through `svg-hush`'s allowlist-based filter: strips
-/// `<script>`, `on*` event-handler attributes, and cross-origin resource
-/// references before this content is ever returned to a caller -- SVG is
-/// executable-ish content (it can embed scripts in a browser-rendering
-/// context), so this is load-bearing, not optional polish. Also configures
+/// `<script>` and `on*` event-handler attributes outright, and neutralizes
+/// cross-origin resource references -- SVG is executable-ish content (it
+/// can embed scripts in a browser-rendering context), so this is
+/// load-bearing, not optional polish. Cross-origin references are
+/// *rewritten* to same-origin absolute paths, not removed: e.g.
+/// `<image href="https://evil.example/track.png"/>` becomes
+/// `<image href="/track.png"/>` -- the reference survives, only the host
+/// is stripped, so no cross-origin fetch survives even though the
+/// reference itself is still present in the output. Also configures
 /// the data-URL filter to permit inline PNG/JPEG/GIF via
 /// `data_url_filter::allow_standard_images` -- `svg-hush`'s own default
 /// (`Filter::new()` with no filter set) drops ALL `data:` URLs
@@ -304,6 +314,78 @@ mod tests {
             matches!(err, SvgGenerationError::Sanitization(_)),
             "an svg with no xmlns must fail sanitization cleanly, not panic or \
              silently produce garbage, got: {err:?}"
+        );
+    }
+
+    /// Pins the actual behavior for cross-origin references: `svg-hush`
+    /// does not drop them, it rewrites them to a same-origin absolute
+    /// path (see the `sanitize_svg` doc comment). This asserts the
+    /// security-relevant part of that claim -- the external host itself
+    /// never survives into the returned string, so no cross-origin fetch
+    /// is possible -- without asserting the exact rewritten path, which
+    /// is `svg-hush`'s implementation detail, not this crate's contract.
+    #[tokio::test]
+    async fn generate_svg_neutralizes_a_cross_origin_reference_without_dropping_it() {
+        let fake = FakeCompleter::returning(Ok("<svg xmlns=\"http://www.w3.org/2000/svg\">\
+             <image href=\"https://some-external-host.example/track.png\"/>\
+             <circle r=\"5\"/></svg>"
+            .to_string()));
+        let svg = generate_svg(&fake, "a circle").await.unwrap();
+        assert!(
+            !svg.contains("some-external-host.example"),
+            "no cross-origin host may survive sanitization, got: {svg}"
+        );
+        assert!(
+            svg.contains("circle"),
+            "sanitizer must keep the safe content"
+        );
+    }
+
+    /// Pins the data-URL policy documented on `sanitize_svg`: an inline
+    /// `data:image/png` URL is a permitted, deliberate relaxation of
+    /// `svg-hush`'s own default (which drops all `data:` URLs), and must
+    /// survive sanitization untouched. Nothing else in the suite exercises
+    /// this, so a future `svg-hush` version bump that changes the default
+    /// would otherwise go unnoticed.
+    #[tokio::test]
+    async fn generate_svg_keeps_an_inline_png_data_url() {
+        let fake = FakeCompleter::returning(Ok("<svg xmlns=\"http://www.w3.org/2000/svg\">\
+             <image href=\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB\
+             AQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=\"/>\
+             </svg>"
+            .to_string()));
+        let svg = generate_svg(&fake, "an image").await.unwrap();
+        assert!(
+            svg.contains("data:image/png"),
+            "an inline PNG data URL must survive sanitization, got: {svg}"
+        );
+    }
+
+    /// Combines a markdown fence, surrounding prose, an `onload` handler,
+    /// and a `<script>` tag in one response -- extraction and
+    /// sanitization are each tested individually elsewhere, but never
+    /// together. This confirms the composition works end to end.
+    #[tokio::test]
+    async fn generate_svg_sanitizes_correctly_through_a_fence_with_prose_and_hostile_content() {
+        let fake = FakeCompleter::returning(Ok("Sure, here's a circle for you:\n\
+             ```svg\n\
+             <svg xmlns=\"http://www.w3.org/2000/svg\" onload=\"alert(1)\">\
+             <script>alert(2)</script><circle r=\"5\"/></svg>\n\
+             ```\n\
+             Hope that helps!"
+            .to_string()));
+        let svg = generate_svg(&fake, "a circle").await.unwrap();
+        assert!(
+            !svg.to_lowercase().contains("onload"),
+            "sanitizer must strip onload handler attributes entirely, got: {svg}"
+        );
+        assert!(
+            !svg.to_lowercase().contains("script"),
+            "sanitizer must strip <script> entirely, got: {svg}"
+        );
+        assert!(
+            svg.contains("circle"),
+            "sanitizer must keep the safe content"
         );
     }
 }
