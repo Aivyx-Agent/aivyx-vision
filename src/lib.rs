@@ -7,6 +7,7 @@
 //! whatever SVG markup comes back.
 
 use async_trait::async_trait;
+use svg_hush::{Filter, data_url_filter};
 
 /// A minimal, product-agnostic "turn a prompt into text" seam. Each
 /// product's own adapter (out of scope for this crate) implements this
@@ -55,19 +56,25 @@ fn extract_svg_markup(response: &str) -> Option<&str> {
     Some(&response[start..end])
 }
 
-use svg_hush::{Filter, data_url_filter};
-
 const SYSTEM_PROMPT: &str = "\
 You are generating a single, self-contained SVG image for the request \
 below. Respond with ONLY the SVG markup, starting with `<svg` and ending \
-with `</svg>`. Do not include any explanation, and do not reference any \
-external file, URL, font, or resource -- everything must be inline \
-within the SVG itself.\n\nRequest: ";
+with `</svg>`. The root `<svg>` element MUST include the attribute \
+`xmlns=\"http://www.w3.org/2000/svg\"`. Do not include any explanation, \
+and do not reference any external file, URL, font, or resource -- \
+everything must be inline within the SVG itself.\n\nRequest: ";
 
 /// Prompt `completer` for an SVG matching `user_prompt`, extract the SVG
 /// markup from its response, sanitize it (strip scripting and external
 /// references via `svg-hush`), and return the clean SVG source. This is
 /// the crate's one public entry point.
+///
+/// The returned string is always a full XML document -- it begins with an
+/// `<?xml version="1.0" encoding="utf-8"?>` processing instruction and is
+/// pretty-printed with indentation, not a bare `<svg>...</svg>` fragment.
+/// `svg-hush` always emits this shape and it can't be configured off, so a
+/// caller splicing this directly into an existing HTML document should
+/// strip the leading declaration first.
 pub async fn generate_svg(
     completer: &dyn TextCompleter,
     user_prompt: &str,
@@ -82,18 +89,42 @@ pub async fn generate_svg(
 /// `<script>`, `on*` event-handler attributes, and cross-origin resource
 /// references before this content is ever returned to a caller -- SVG is
 /// executable-ish content (it can embed scripts in a browser-rendering
-/// context), so this is load-bearing, not optional polish. Also rejects
-/// any `data:` URL that isn't a standard inline image, via
-/// `data_url_filter::allow_standard_images`, rather than allowing
-/// arbitrary `data:` schemes through unchecked.
+/// context), so this is load-bearing, not optional polish. Also configures
+/// the data-URL filter to permit inline PNG/JPEG/GIF via
+/// `data_url_filter::allow_standard_images` -- `svg-hush`'s own default
+/// (`Filter::new()` with no filter set) drops ALL `data:` URLs
+/// unconditionally, so this is a deliberate relaxation, not a restriction:
+/// it exists because `SYSTEM_PROMPT` requires embedded resources to be
+/// inline, and this is how a compliant model does that. Other `data:`
+/// schemes (including nested `data:image/svg+xml`) are still dropped.
+///
+/// Note: the returned string is a full XML document (leading `<?xml ...?>`
+/// declaration, pretty-printed), not a bare `<svg>...</svg>` fragment --
+/// see [`generate_svg`]'s doc comment.
 fn sanitize_svg(svg: &str) -> Result<String, SvgGenerationError> {
     let mut filter = Filter::new();
     filter.set_data_url_filter(data_url_filter::allow_standard_images);
     let mut out = Vec::new();
     filter
         .filter(&mut svg.as_bytes(), &mut out)
-        .map_err(|e| SvgGenerationError::Sanitization(e.to_string()))?;
-    String::from_utf8(out).map_err(|e| SvgGenerationError::Sanitization(e.to_string()))
+        .map_err(|e| SvgGenerationError::Sanitization(describe_error(&e)))?;
+    String::from_utf8(out).map_err(|e| SvgGenerationError::Sanitization(describe_error(&e)))
+}
+
+/// Walk an error's `source()` chain and join every level's `Display`
+/// message with `": "`, so detail that only lives deeper in the chain
+/// (e.g. `svg-hush`'s `FError::Writer`'s generic "XML encoding error"
+/// hides the actionable "No acceptable SVG elements found" one level
+/// down) isn't discarded when the error is turned into a message string.
+fn describe_error(err: &dyn std::error::Error) -> String {
+    let mut msg = err.to_string();
+    let mut source = err.source();
+    while let Some(s) = source {
+        msg.push_str(": ");
+        msg.push_str(&s.to_string());
+        source = s.source();
+    }
+    msg
 }
 
 #[cfg(test)]
@@ -225,6 +256,54 @@ mod tests {
         assert!(
             svg.contains("circle"),
             "sanitizer must keep the safe content"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_svg_strips_an_onload_handler_attribute() {
+        let fake = FakeCompleter::returning(Ok(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" onload=\"alert(1)\">\
+             <circle r=\"5\"/></svg>"
+                .to_string(),
+        ));
+        let svg = generate_svg(&fake, "a circle").await.unwrap();
+        assert!(
+            !svg.to_lowercase().contains("onload"),
+            "sanitizer must strip onload handler attributes entirely, got: {svg}"
+        );
+        assert!(
+            svg.contains("circle"),
+            "sanitizer must keep the safe content"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_svg_strips_a_foreign_object_element() {
+        let fake = FakeCompleter::returning(Ok(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\"><foreignObject>\
+             <body xmlns=\"http://www.w3.org/1999/xhtml\"><script>alert(1)\
+             </script></body></foreignObject><circle r=\"5\"/></svg>"
+                .to_string(),
+        ));
+        let svg = generate_svg(&fake, "a circle").await.unwrap();
+        assert!(
+            !svg.to_lowercase().contains("foreignobject"),
+            "sanitizer must strip <foreignObject> entirely, got: {svg}"
+        );
+        assert!(
+            svg.contains("circle"),
+            "sanitizer must keep the safe content"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_svg_errors_clearly_when_response_omits_the_svg_namespace() {
+        let fake = FakeCompleter::returning(Ok("<svg><circle r=\"5\"/></svg>".to_string()));
+        let err = generate_svg(&fake, "a circle").await.unwrap_err();
+        assert!(
+            matches!(err, SvgGenerationError::Sanitization(_)),
+            "an svg with no xmlns must fail sanitization cleanly, not panic or \
+             silently produce garbage, got: {err:?}"
         );
     }
 }
