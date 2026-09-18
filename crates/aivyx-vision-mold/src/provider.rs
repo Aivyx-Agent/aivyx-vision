@@ -4,6 +4,11 @@
 //! bytes to disk, and returns a `GeneratedAsset`. `generate_3d` returns
 //! `VisionError::Unsupported` -- see this crate's own top-level doc
 //! comment for why.
+//!
+//! `generate_image`'s own acquire/generate/release/write sequence runs on
+//! an internally spawned task, detached from the caller's own future --
+//! see `generate_image`'s doc comment for why a `Drop`-based release
+//! guard would have been the wrong fix.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -68,19 +73,19 @@ impl MoldProvider {
 
 #[async_trait]
 impl GenerationProvider for MoldProvider {
-    /// Detached from the caller's own future on purpose -- see this
-    /// module's top-level doc comment (or the design rationale in
+    /// Detached from the caller's own future on purpose. A `Drop`-based
+    /// release guard would have been the *wrong* fix here: releasing the
+    /// lock the instant the caller's future is dropped could free it
+    /// before `mold serve` has actually finished the in-flight
+    /// generation, letting a second caller start a second GPU job while
+    /// the first is still running. Spawning the whole
+    /// `acquire -> generate -> release -> write` sequence and only
+    /// `.await`ing the `JoinHandle` here means a cancelled caller
+    /// abandons *waiting on the result*, never the operation itself --
+    /// the lock is only ever released after generation has genuinely
+    /// finished, cancelled or not. See
     /// `docs/superpowers/plans/2026-09-19-gpu-lock-cancellation-safety.md`
-    /// if that's been pruned) for why a `Drop`-based release guard would
-    /// have been the *wrong* fix: releasing the lock the instant the
-    /// caller's future is dropped could free it before `mold serve` has
-    /// actually finished the in-flight generation, letting a second
-    /// caller start a second GPU job while the first is still running.
-    /// Spawning the whole `acquire -> generate -> release -> write`
-    /// sequence and only `.await`ing the `JoinHandle` here means a
-    /// cancelled caller abandons *waiting on the result*, never the
-    /// operation itself -- the lock is only ever released after
-    /// generation has genuinely finished, cancelled or not.
+    /// for the full design rationale, if useful.
     async fn generate_image(&self, req: ImageRequest) -> Result<GeneratedAsset, VisionError> {
         let gpu_lock = self.gpu_lock.clone();
         let mold = self.mold.clone();
