@@ -40,3 +40,13 @@ model itself.
 See `aivyx-ecosystem/docs/superpowers/specs/2026-09-18-aivyx-vision-v1-design.md`
 for the full design and the two other planned milestones (image and 3D
 model generation).
+
+## Milestone 2 (Pass A): image generation
+
+`crates/aivyx-vision-mold` implements `GenerationProvider::generate_image`
+against an operator-run [`mold serve`](https://github.com/utensils/mold)
+instance, coordinated with local LLM inference sharing the same GPU via
+[`aivyx-broker`](https://github.com/Aivyx-Agent/aivyx-broker)'s GPU lock.
+See `crates/aivyx-vision-mold/README.md` for configuration and status —
+`generate_3d` is not yet implemented (Pass B, a separate future build
+pass covering mold's async 3D job-lifecycle API).

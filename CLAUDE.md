@@ -10,8 +10,11 @@ with code in this repository.
 output as agent tool calls. This is now a Cargo workspace: `crates/aivyx-vision-svg`
 (the vector/graphic-design milestone), `crates/aivyx-vision-core` (the
 `GenerationProvider` trait + shared types, no I/O), and
-`crates/aivyx-vision-mold` (mold-backed image generation — the image
-milestone, 3D generation still pending its own build pass). See
+`crates/aivyx-vision-mold` (mold-backed image generation — Milestone 2
+Pass A shipped: `generate_image` via `mold serve`'s synchronous
+`/api/generate`, coordinated through `aivyx-broker`'s GPU lock;
+`generate_3d` returns `VisionError::Unsupported` until Pass B implements
+mold's async `/api/mesh-workflows` job-lifecycle surface). See
 `README.md` and
 `aivyx-ecosystem/docs/superpowers/specs/2026-09-18-aivyx-vision-v1-design.md`
 for the full rationale — this file only covers what's specific to working
