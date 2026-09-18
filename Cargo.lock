@@ -3,6 +3,15 @@
 version = 4
 
 [[package]]
+name = "aivyx-vision-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "aivyx-vision-svg"
 version = "0.1.0"
 dependencies = [

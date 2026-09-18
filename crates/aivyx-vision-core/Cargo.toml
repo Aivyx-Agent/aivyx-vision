@@ -1,0 +1,16 @@
+[package]
+name = "aivyx-vision-core"
+description = "GenerationProvider trait, request/response types, and VisionError -- the shared, backend-agnostic contract for the Aivyx-Vision toolset. No I/O, no backend dependencies."
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[features]
+testing = []
+
+[dependencies]
+async-trait = "0.1.89"
+thiserror = "2.0.18"
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["macros", "rt"] }
