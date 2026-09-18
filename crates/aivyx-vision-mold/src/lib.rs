@@ -12,5 +12,7 @@
 //! is deliberately deferred to its own build pass ("Pass B").
 
 pub mod gpu_lock_client;
+pub mod mold_client;
 
 pub use gpu_lock_client::{GpuLockClient, GpuLockClientError, LeaseId};
+pub use mold_client::{GenerateImageRequest, GenerateImageResponse, MoldClient, MoldClientError};
