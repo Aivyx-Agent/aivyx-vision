@@ -4,6 +4,10 @@ LLM-prompted SVG generation, sanitized before return — the first shipped
 slice of the Aivyx-Vision toolset (image and 3D model generation follow
 in later milestones; see the design doc below).
 
+This repo is now a Cargo workspace — `crates/aivyx-vision-svg` (this
+crate), `crates/aivyx-vision-core`, and `crates/aivyx-vision-mold` are
+its three members.
+
 `generate_svg(completer, user_prompt)` prompts a caller-supplied
 `TextCompleter` — a minimal, product-agnostic seam this crate defines
 itself, not tied to any particular LLM provider — for SVG markup matching

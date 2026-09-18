@@ -7,34 +7,36 @@ with code in this repository.
 
 `aivyx-vision` is a shared, local-first generation toolset for
 `aivyx-pa` and `aivyx-coder` — image, 3D model, and vector/graphic-design
-output as agent tool calls. This repo currently holds one crate,
-`aivyx-vision-svg` (the vector/graphic-design milestone); image and 3D
-generation land in later milestones as sibling crates
-(`aivyx-vision-core`, `aivyx-vision-mold`, `aivyx-vision-comfyui`), at
-which point this repo becomes a Cargo workspace. See `README.md` and
+output as agent tool calls. This is now a Cargo workspace: `crates/aivyx-vision-svg`
+(the vector/graphic-design milestone), `crates/aivyx-vision-core` (the
+`GenerationProvider` trait + shared types, no I/O), and
+`crates/aivyx-vision-mold` (mold-backed image generation — the image
+milestone, 3D generation still pending its own build pass). See
+`README.md` and
 `aivyx-ecosystem/docs/superpowers/specs/2026-09-18-aivyx-vision-v1-design.md`
 for the full rationale — this file only covers what's specific to working
 in this repo's code.
 
-No consumer depends on this crate yet — `aivyx-pa`'s and `aivyx-coder`'s
-own adoption of `vision.generate_svg`-shaped tools is separate, later
+No consumer depends on any of these crates yet — `aivyx-pa`'s and
+`aivyx-coder`'s own adoption of `vision.*`-shaped tools is separate, later
 work (each product's own `docs/superpowers/plans/`).
 
 ## Build, test, lint
 
 ```sh
-cargo build
-cargo test
-cargo clippy --all-targets -- -D warnings
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-Single crate, no workspace yet — no `-p` flag needed. Single test:
-`cargo test <test_name>`.
+Cargo workspace, three members under `crates/` — use `-p <crate-name>` to
+target one crate. Single test: `cargo test <test_name>`.
 
 ## Architecture
 
-Single file, `src/lib.rs`:
+`aivyx-vision-svg`'s own architecture (single file,
+`crates/aivyx-vision-svg/src/lib.rs`):
 
 - `TextCompleter` — this crate's only LLM seam: one method,
   `async fn complete(&self, prompt: &str) -> Result<String,
