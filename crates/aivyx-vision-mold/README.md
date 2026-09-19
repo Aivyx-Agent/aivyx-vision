@@ -69,3 +69,8 @@ fall back to `bin`).
   completion regardless -- the lock is only ever released after
   generation genuinely finishes, never early. A cancelled call still
   costs real GPU time server-side; the caller just never sees the result.
+  This closes *future-drop* cancellation specifically -- a panic inside
+  the spawned task before `release()` runs (unrelated to cancellation,
+  and no worse than before this task existed) still leaks the lease until
+  `aivyx-broker`'s `reap_expired` reclaims it; there's no `Drop` guard for
+  that narrower case either, by the same reasoning above.
