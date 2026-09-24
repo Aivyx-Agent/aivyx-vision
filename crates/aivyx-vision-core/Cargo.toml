@@ -3,7 +3,8 @@ name = "aivyx-vision-core"
 description = "GenerationProvider trait, request/response types, and VisionError -- the shared, backend-agnostic contract for the Aivyx-Vision toolset. No I/O, no backend dependencies."
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "BUSL-1.1"
+publish = false
 
 [features]
 testing = []

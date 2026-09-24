@@ -3,7 +3,8 @@ name = "aivyx-vision-mold"
 description = "HTTP-client backend for Aivyx-Vision's GenerationProvider trait, talking to an operator-run `mold serve` instance for image generation, coordinated via aivyx-broker's GPU lock"
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "BUSL-1.1"
+publish = false
 
 [dependencies]
 aivyx-vision-core = { path = "../aivyx-vision-core" }
