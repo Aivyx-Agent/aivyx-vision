@@ -1,5 +1,7 @@
 # aivyx-vision
 
+[![License: BUSL-1.1](https://img.shields.io/badge/license-BUSL--1.1-blue.svg)](LICENSE)
+
 LLM-prompted SVG generation, sanitized before return — the first shipped
 slice of the Aivyx-Vision toolset (image and 3D model generation follow
 in later milestones; see the design doc below).
