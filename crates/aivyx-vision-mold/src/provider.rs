@@ -187,6 +187,9 @@ fn map_gpu_lock_error(e: GpuLockClientError) -> VisionError {
         GpuLockClientError::ReleaseRejected(msg) => {
             VisionError::BackendUnreachable(format!("aivyx-broker: {msg}"))
         }
+        GpuLockClientError::ResponseTooLarge(cap) => VisionError::BackendUnreachable(format!(
+            "aivyx-broker: response exceeded the {cap}-byte limit"
+        )),
     }
 }
 
@@ -215,6 +218,9 @@ fn map_mold_error(e: MoldClientError) -> VisionError {
             code,
             message,
         },
+        MoldClientError::ResponseTooLarge(cap) => VisionError::BackendUnreachable(format!(
+            "mold serve: response exceeded the {cap}-byte limit"
+        )),
     }
 }
 

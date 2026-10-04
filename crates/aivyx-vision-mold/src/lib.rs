@@ -11,6 +11,7 @@
 //! than the synchronous `/api/generate` this crate currently wraps, and
 //! is deliberately deferred to its own build pass ("Pass B").
 
+mod body_limits;
 pub mod gpu_lock_client;
 pub mod mold_client;
 mod provider;

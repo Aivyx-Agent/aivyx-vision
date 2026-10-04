@@ -8,7 +8,37 @@
 //! management, gallery, mesh workflows, streaming/SSE generation) that
 //! are out of scope here.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
+
+use crate::body_limits::{self, CappedBodyError};
+
+/// `mold serve` returns real generated image bytes on success -- large,
+/// but bounded. 64 MiB comfortably covers legitimate PNG/JPEG/WebP output
+/// at any size `MoldConfig`'s width/height/steps could reasonably
+/// produce, while still bounding a misbehaving or malicious server's
+/// response to a fixed, finite amount of memory rather than whatever it
+/// chooses to send.
+pub(crate) const MAX_IMAGE_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+/// `mold serve`'s own error responses are small, hand-written JSON
+/// (`{"error", "code"}`) -- nowhere near large enough to need anything
+/// close to `MAX_IMAGE_RESPONSE_BYTES`.
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+/// How long `generate()` is allowed to take *overall* -- connecting,
+/// sending the request, and reading the full response body -- before it
+/// gives up, as a mechanism distinct from the HTTP client's own
+/// `read_timeout` (`MOLD_READ_TIMEOUT` in `provider.rs`). `read_timeout`
+/// only bounds a single read operation and resets after each one
+/// succeeds, so a server that trickles a response a few bytes at a time
+/// -- each individual read completing comfortably inside that per-read
+/// window -- could otherwise hold a request open indefinitely without
+/// ever tripping it. This is a true ceiling on the whole call instead,
+/// using the same "generous enough for realistic local FLUX/SDXL
+/// generation time" reasoning `MOLD_READ_TIMEOUT` already documents.
+const DEFAULT_MOLD_OVERALL_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct GenerateImageRequest {
@@ -57,6 +87,15 @@ pub enum MoldClientError {
         code: Option<String>,
         message: String,
     },
+    #[error("mold serve's response exceeded the {0}-byte limit")]
+    ResponseTooLarge(usize),
+}
+
+fn map_capped_body_error(e: CappedBodyError) -> MoldClientError {
+    match e {
+        CappedBodyError::TooLarge(cap) => MoldClientError::ResponseTooLarge(cap),
+        CappedBodyError::Transport(e) => classify_transport_error(e),
+    }
 }
 
 /// Classifies a `reqwest::Error` from a mold serve request. A *connect*
@@ -79,6 +118,7 @@ pub struct MoldClient {
     http: reqwest::Client,
     base_url: String,
     api_key: Option<String>,
+    overall_timeout: Duration,
 }
 
 impl MoldClient {
@@ -87,10 +127,31 @@ impl MoldClient {
             http,
             base_url,
             api_key,
+            overall_timeout: DEFAULT_MOLD_OVERALL_TIMEOUT,
         }
     }
 
+    /// Overrides the default overall per-request deadline (see
+    /// `DEFAULT_MOLD_OVERALL_TIMEOUT`). A seam for tests that need a
+    /// short deadline to exercise that path deterministically and
+    /// quickly, without waiting on the real multi-minute default;
+    /// production callers should rarely need this.
+    pub fn with_overall_timeout(mut self, overall_timeout: Duration) -> Self {
+        self.overall_timeout = overall_timeout;
+        self
+    }
+
     pub async fn generate(
+        &self,
+        req: GenerateImageRequest,
+    ) -> Result<GenerateImageResponse, MoldClientError> {
+        match tokio::time::timeout(self.overall_timeout, self.generate_inner(req)).await {
+            Ok(result) => result,
+            Err(_) => Err(MoldClientError::Timeout),
+        }
+    }
+
+    async fn generate_inner(
         &self,
         req: GenerateImageRequest,
     ) -> Result<GenerateImageResponse, MoldClientError> {
@@ -116,11 +177,9 @@ impl MoldClient {
                 .get("x-mold-seed-used")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<u64>().ok());
-            let bytes = response
-                .bytes()
+            let bytes = body_limits::read_capped_body(response, MAX_IMAGE_RESPONSE_BYTES)
                 .await
-                .map_err(classify_transport_error)?
-                .to_vec();
+                .map_err(map_capped_body_error)?;
             return Ok(GenerateImageResponse {
                 bytes,
                 content_type,
@@ -133,7 +192,10 @@ impl MoldClient {
             error: String,
             code: Option<String>,
         }
-        let body: ErrorBody = response.json().await.unwrap_or(ErrorBody {
+        let error_bytes = body_limits::read_capped_body(response, MAX_ERROR_BODY_BYTES)
+            .await
+            .map_err(map_capped_body_error)?;
+        let body: ErrorBody = serde_json::from_slice(&error_bytes).unwrap_or(ErrorBody {
             error: "(no error body)".to_string(),
             code: None,
         });
@@ -321,6 +383,85 @@ mod tests {
             .build()
             .unwrap();
         let client = MoldClient::new(http, mold.uri(), None);
+        let err = client
+            .generate(GenerateImageRequest {
+                prompt: "anything".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MoldClientError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn generate_fails_with_a_clear_error_when_the_response_body_exceeds_the_cap() {
+        let mold = MockServer::start().await;
+        // One byte over the cap, declared via Content-Length -- the fix
+        // must reject this before ever buffering the whole thing.
+        let oversized_body = vec![0u8; MAX_IMAGE_RESPONSE_BYTES + 1];
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(oversized_body)
+                    .insert_header("content-type", "image/png"),
+            )
+            .mount(&mold)
+            .await;
+
+        let client = MoldClient::new(reqwest::Client::new(), mold.uri(), None);
+        let err = client
+            .generate(GenerateImageRequest {
+                prompt: "anything".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            MoldClientError::ResponseTooLarge(cap) if cap == MAX_IMAGE_RESPONSE_BYTES
+        ));
+    }
+
+    #[tokio::test]
+    async fn generate_returns_timeout_when_the_overall_deadline_elapses_despite_no_single_stall() {
+        // A hand-rolled TCP server rather than wiremock: the bug this is
+        // regression-testing is specifically that a server trickling a
+        // response a few bytes at a time -- each individual gap well
+        // inside any per-read timeout -- could hold the request open
+        // indefinitely, because only a per-read timeout existed. wiremock
+        // has no primitive for streaming a body slowly one write at a
+        // time, so this drives a raw socket directly.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut discard = [0u8; 1024];
+            let _ = socket.read(&mut discard).await;
+
+            let body = b"not-a-real-png-but-fine";
+            let header = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: image/png\r\ncontent-length: {}\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(header.as_bytes()).await;
+            for chunk in body.chunks(4) {
+                let _ = socket.write_all(chunk).await;
+                let _ = socket.flush().await;
+                // Each individual gap (30ms) is far below any reasonable
+                // per-read timeout; only their sum (6 * 30ms = 180ms),
+                // bounded by the overall deadline below, catches this.
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        });
+
+        let client = MoldClient::new(reqwest::Client::new(), format!("http://{addr}"), None)
+            .with_overall_timeout(Duration::from_millis(80));
+
         let err = client
             .generate(GenerateImageRequest {
                 prompt: "anything".to_string(),
