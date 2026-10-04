@@ -20,9 +20,13 @@ mold's async `/api/mesh-workflows` job-lifecycle surface). See
 for the full rationale — this file only covers what's specific to working
 in this repo's code.
 
-No consumer depends on any of these crates yet — `aivyx-pa`'s and
-`aivyx-coder`'s own adoption of `vision.*`-shaped tools is separate, later
-work (each product's own `docs/superpowers/plans/`).
+Both `aivyx-pa` and `aivyx-coder` depend on all three crates
+(`aivyx-vision-svg`, `aivyx-vision-core`, `aivyx-vision-mold`) — `aivyx-pa`
+via its `crates/aivyx-vision` tool process, `aivyx-coder` via
+`crates/aivyx-tools`/`crates/aivyx-mcp-server`/`crates/aivyx`. Each
+product's own `vision.*`-shaped tool wiring (the tool definitions
+themselves, config, prompt surface) still lives in that product's own
+`docs/superpowers/plans/`, not here.
 
 ## Build, test, lint
 
