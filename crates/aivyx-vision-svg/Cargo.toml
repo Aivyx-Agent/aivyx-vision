@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 async-trait = "0.1.89"
 svg-hush = "0.9.7"
+xml = "1.4.0"
 thiserror = "2.0.18"
 
 [dev-dependencies]

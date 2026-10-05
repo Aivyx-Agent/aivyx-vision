@@ -59,7 +59,17 @@ target one crate. Single test: `cargo test <test_name>`.
   sanitization with an XML-parsing error rather than being correctly
   extracted — a known, accepted limitation, not silently wrong (it fails
   closed, never emits a truncated or wrong block).
-- `sanitize_svg` — wraps the `svg-hush` crate's allowlist-based filter.
+- `sanitize_svg` — input limits (`MAX_SVG_INPUT_BYTES`, `MAX_SVG_DEPTH`;
+  `svg-hush`'s pretty-printing is quadratic in depth), then the `svg-hush`
+  crate's allowlist-based filter, then `restrict_to_in_document_content`,
+  a post-filter over `svg-hush`'s output that drops all CSS and every
+  non-`#fragment`/non-`data:` reference (`svg-hush` misses CSS
+  `image-set()` and rewrites off-document URLs to same-origin paths
+  instead of removing them — audit 2026-10-04 V1/V3). Known, accepted
+  losses: CSS-styled SVGs render with default fills (`SYSTEM_PROMPT` asks
+  for presentation attributes instead), any attribute containing `\` is
+  dropped, and `svg-hush` strips `xml:space="preserve"`, so runs of spaces
+  in `<text>` collapse (audit V5, not fixed).
   **Load-bearing, not optional**: SVG is executable-ish content, and this
   is the only thing standing between a model's raw output and whatever
   re-renders the result. `generate_svg_strips_a_script_tag`'s test is
