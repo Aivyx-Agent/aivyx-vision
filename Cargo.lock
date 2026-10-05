@@ -46,6 +46,7 @@ dependencies = [
  "svg-hush",
  "thiserror",
  "tokio",
+ "xml",
 ]
 
 [[package]]
