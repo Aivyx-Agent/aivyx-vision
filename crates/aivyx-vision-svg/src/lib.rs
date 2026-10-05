@@ -81,7 +81,9 @@ below. Respond with ONLY the SVG markup, starting with `<svg` and ending \
 with `</svg>`. The root `<svg>` element MUST include the attribute \
 `xmlns=\"http://www.w3.org/2000/svg\"`. Do not include any explanation, \
 and do not reference any external file, URL, font, or resource -- \
-everything must be inline within the SVG itself.\n\nRequest: ";
+everything must be inline within the SVG itself. Style elements with \
+presentation attributes such as `fill`, `stroke`, and `font-size`, not \
+CSS: `<style>` elements and `style` attributes are removed.\n\nRequest: ";
 
 /// Prompt `completer` for an SVG matching `user_prompt`, extract the SVG
 /// markup from its response, sanitize it (strip scripting, all CSS, and
