@@ -47,13 +47,7 @@ pub struct MoldProvider {
 
 impl MoldProvider {
     pub fn new(config: MoldConfig) -> Result<Self, VisionError> {
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .read_timeout(MOLD_READ_TIMEOUT)
-            .build()
-            .map_err(|e| {
-                VisionError::BackendUnreachable(format!("failed to build HTTP client: {e}"))
-            })?;
+        let http = build_http_client()?;
 
         // Trimmed here, once, rather than at each of the three `format!`
         // call sites inside `mold_client.rs`/`gpu_lock_client.rs` -- a
@@ -123,6 +117,39 @@ impl GenerationProvider for MoldProvider {
     }
 }
 
+/// No redirects: a redirect would carry the `X-Api-Key` header (and the
+/// prompt, on 307/308) to whatever host the endpoint names, and hand the
+/// body of an arbitrary URL to the agent as "the generated image".
+fn build_http_client() -> Result<reqwest::Client, VisionError> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .read_timeout(MOLD_READ_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| VisionError::BackendUnreachable(format!("failed to build HTTP client: {e}")))
+}
+
+/// A reference image larger than this is refused rather than read whole.
+const MAX_REFERENCE_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+
+/// Reads a reference image with a size cap. `path` must already be
+/// validated by the caller (this does not restrict where it points).
+fn read_reference_image(path: &Path) -> Result<Vec<u8>, VisionError> {
+    use std::io::Read;
+    let io = |e: std::io::Error| VisionError::Io(format!("reading reference image {path:?}: {e}"));
+    let file = std::fs::File::open(path).map_err(io)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_REFERENCE_IMAGE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io)?;
+    if bytes.len() as u64 > MAX_REFERENCE_IMAGE_BYTES {
+        return Err(VisionError::Io(format!(
+            "reference image {path:?} is larger than the {MAX_REFERENCE_IMAGE_BYTES}-byte limit"
+        )));
+    }
+    Ok(bytes)
+}
+
 fn build_mold_request(req: &ImageRequest) -> Result<GenerateImageRequest, VisionError> {
     let prompt = match &req.style_hint {
         Some(hint) => format!("{}, {hint}", req.prompt),
@@ -130,8 +157,7 @@ fn build_mold_request(req: &ImageRequest) -> Result<GenerateImageRequest, Vision
     };
     let source_image = match &req.reference_image {
         Some(path) => {
-            let bytes = std::fs::read(path)
-                .map_err(|e| VisionError::Io(format!("reading reference image {path:?}: {e}")))?;
+            let bytes = read_reference_image(path)?;
             Some(base64::engine::general_purpose::STANDARD.encode(bytes))
         }
         None => None,
@@ -232,6 +258,54 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+
+    #[test]
+    fn an_oversized_reference_image_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big.png");
+        let f = std::fs::File::create(&big).unwrap();
+        f.set_len(MAX_REFERENCE_IMAGE_BYTES + 1).unwrap();
+        let err = read_reference_image(&big).unwrap_err().to_string();
+        assert!(err.contains("limit"), "{err}");
+        let ok = dir.path().join("ok.png");
+        std::fs::write(&ok, b"png").unwrap();
+        assert_eq!(read_reference_image(&ok).unwrap(), b"png");
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_not_followed_and_the_api_key_goes_nowhere_else() {
+        let mold = MockServer::start().await;
+        let elsewhere = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/api/generate", elsewhere.uri())),
+            )
+            .mount(&mold)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![1, 2, 3]))
+            .expect(0)
+            .mount(&elsewhere)
+            .await;
+        let client = MoldClient::new(
+            build_http_client().unwrap(),
+            mold.uri(),
+            Some("secret-key".to_string()),
+        );
+        let result = client
+            .generate(GenerateImageRequest {
+                prompt: "x".to_string(),
+                ..Default::default()
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "a redirect must not count as a generated image"
+        );
+        assert!(elsewhere.received_requests().await.unwrap().is_empty());
+    }
 
     async fn test_provider(
         broker: &MockServer,
