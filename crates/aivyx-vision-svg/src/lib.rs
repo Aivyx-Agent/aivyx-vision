@@ -1,6 +1,5 @@
 //! LLM-prompted SVG generation, sanitized before return. Part of the
-//! Aivyx-Vision toolset (see `aivyx-ecosystem/docs/superpowers/specs/
-//! 2026-09-18-aivyx-vision-v1-design.md`) -- the vector/graphic-design
+//! Aivyx-Vision toolset -- the vector/graphic-design
 //! milestone, which deliberately needs no image/3D generation engine at
 //! all: it prompts the *caller's own already-configured* text-completion
 //! backend (see `TextCompleter`) and sanitizes whatever SVG markup comes
@@ -48,11 +47,8 @@ pub enum SvgGenerationError {
 /// response. Finds the first `<svg` and the last `</svg>` in the whole
 /// response and slices between them (inclusive). This tolerates a
 /// markdown code fence around the block, and prose that doesn't itself
-/// mention `<svg>` before the real block. A response that mentions `<svg`
-/// in prose ahead of the actual fenced block will fail sanitization with
-/// an XML-parsing error rather than being correctly extracted -- a known,
-/// accepted limitation, not silently wrong (it fails closed, never emits
-/// a truncated or wrong block). Returns `None` if no `<svg`/`</svg>` pair
+/// mention `<svg>` before the real block; [`svg_candidates`] covers the
+/// cases this alone gets wrong. Returns `None` if no `<svg`/`</svg>` pair
 /// is present, or if the `</svg>` found is before the `<svg` found
 /// (malformed / truncated response).
 fn extract_svg_markup(response: &str) -> Option<&str> {
@@ -62,6 +58,50 @@ fn extract_svg_markup(response: &str) -> Option<&str> {
         return None;
     }
     Some(&response[start..end])
+}
+
+/// Most candidate blocks [`generate_svg`] will try to sanitize from one
+/// response, bounding the work a long, `<svg`-littered reply can cause.
+const MAX_SVG_CANDIDATES: usize = 8;
+
+/// The blocks to try, best guess first, de-duplicated:
+///
+/// 1. the contents of the first ```` ```svg ```` (or ```` ```xml ````)
+///    fence, so prose that mentions `<svg>` before the fence doesn't
+///    matter;
+/// 2. [`extract_svg_markup`] over the whole response;
+/// 3. from each later `<svg` start, to the last `</svg>` and to the first
+///    `</svg>` after it, so a reply with two drawings yields the first.
+///
+/// Every candidate still goes through the full sanitizer; this only
+/// chooses which text to hand it.
+fn svg_candidates(response: &str) -> Vec<&str> {
+    fn push<'a>(out: &mut Vec<&'a str>, c: Option<&'a str>) {
+        if let Some(c) = c
+            && !out.contains(&c)
+            && out.len() < MAX_SVG_CANDIDATES
+        {
+            out.push(c);
+        }
+    }
+    let mut out: Vec<&str> = Vec::new();
+    for fence in ["```svg", "```xml"] {
+        if let Some(open) = response.find(fence) {
+            let body = &response[open + fence.len()..];
+            let body = &body[..body.find("```").unwrap_or(body.len())];
+            push(&mut out, extract_svg_markup(body));
+        }
+    }
+    push(&mut out, extract_svg_markup(response));
+    for (start, _) in response.match_indices("<svg") {
+        let rest = &response[start..];
+        push(
+            &mut out,
+            rest.find("</svg>").map(|end| &rest[..end + "</svg>".len()]),
+        );
+        push(&mut out, extract_svg_markup(rest));
+    }
+    out
 }
 
 /// Largest extracted `<svg>` block, in bytes, that [`generate_svg`] will
@@ -104,8 +144,19 @@ pub async fn generate_svg(
 ) -> Result<String, SvgGenerationError> {
     let full_prompt = format!("{SYSTEM_PROMPT}{user_prompt}");
     let raw = completer.complete(&full_prompt).await?;
-    let extracted = extract_svg_markup(&raw).ok_or(SvgGenerationError::NoSvgFound)?;
-    sanitize_svg(extracted)
+    // The first candidate that sanitizes wins; if none does, the first
+    // candidate's error is the one reported (it is the most likely
+    // intended block).
+    let mut first_error = None;
+    for candidate in svg_candidates(&raw) {
+        match sanitize_svg(candidate) {
+            Ok(svg) => return Ok(svg),
+            Err(e) => {
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    Err(first_error.unwrap_or(SvgGenerationError::NoSvgFound))
 }
 
 /// Sanitize `svg` in three steps, each fail-closed:
@@ -671,6 +722,55 @@ mod tests {
             svg.len(),
             input_len
         );
+    }
+
+    /// Audit 2026-11-11 L5: prose that mentions `<svg>` before the fenced
+    /// block used to fail the whole call with an XML error.
+    #[tokio::test]
+    async fn generate_svg_finds_the_fenced_block_after_prose_mentioning_svg() {
+        let fake = FakeCompleter::returning(Ok("I'll make an <svg> icon for you:\n\
+             ```svg\n<svg xmlns=\"http://www.w3.org/2000/svg\"><circle r=\"5\"/></svg>\n```"
+            .to_string()));
+        let svg = generate_svg(&fake, "a circle").await.unwrap();
+        assert!(svg.contains("<circle"), "got: {svg}");
+    }
+
+    #[tokio::test]
+    async fn generate_svg_finds_an_unfenced_block_after_prose_mentioning_svg() {
+        let fake = FakeCompleter::returning(Ok("Here is the <svg> you asked for: \
+             <svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"5\"/></svg>"
+            .to_string()));
+        let svg = generate_svg(&fake, "a square").await.unwrap();
+        assert!(svg.contains("<rect"), "got: {svg}");
+    }
+
+    #[tokio::test]
+    async fn generate_svg_takes_the_first_of_two_drawings() {
+        let fake = FakeCompleter::returning(Ok(format!(
+            "<svg {NS}><circle r=\"5\"/></svg> or, if you prefer, <svg {NS}><rect width=\"5\"/></svg>"
+        )));
+        let svg = generate_svg(&fake, "a shape").await.unwrap();
+        assert!(
+            svg.contains("<circle") && !svg.contains("<rect"),
+            "got: {svg}"
+        );
+    }
+
+    /// A later candidate is still sanitized: falling back past a broken
+    /// first block must not let hostile content through.
+    #[tokio::test]
+    async fn generate_svg_sanitizes_a_fallback_candidate_too() {
+        let fake = FakeCompleter::returning(Ok(format!(
+            "<svg> broken <svg {NS} onload=\"alert(1)\"><script>alert(2)</script>\
+             <circle r=\"5\"/></svg>"
+        )));
+        let svg = generate_svg(&fake, "a circle").await.unwrap();
+        let lower = svg.to_lowercase();
+        assert!(
+            !lower.contains("onload") && !lower.contains("script"),
+            "got: {svg}"
+        );
+        assert!(svg.contains("<circle"));
     }
 
     /// Combines a markdown fence, surrounding prose, an `onload` handler,
