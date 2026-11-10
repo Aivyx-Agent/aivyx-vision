@@ -2,13 +2,11 @@
 //! / `POST /gpu-lock/release`) -- the primitive `aivyx-vision-mold` uses
 //! to keep its GPU-heavy generation calls from contending with local LLM
 //! inference sharing the same machine. See `aivyx-broker/src/gpu_lock.rs`
-//! for the lock's own implementation and
-//! `aivyx-ecosystem/docs/superpowers/specs/
-//! 2026-09-18-aivyx-vision-v1-design.md` §5 for why this exists here
-//! rather than reusing `aivyx-broker`'s llama-server-specific scheduling.
+//! for the lock's own implementation; the Aivyx-Vision v1 design (§5)
+//! explains why this exists here rather than reusing `aivyx-broker`'s llama-server-specific scheduling.
 //!
-//! Two defensive limits on top of the happy path above (Audit note:
-//! `~/aivyx-audit-2026-10-04/C-report.md`, item V7): a cap on how much
+//! Two defensive limits on top of the happy path above (audit
+//! 2026-10-04, item V7): a cap on how much
 //! response-body memory a single call will ever buffer
 //! (`MAX_JSON_RESPONSE_BYTES`, enforced via `crate::body_limits`), and an
 //! overall per-request deadline (`overall_timeout`, defaulting to
@@ -26,6 +24,10 @@ use crate::body_limits::{self, CappedBodyError};
 /// near large enough to need anything like `aivyx-vision-mold`'s own
 /// `MAX_IMAGE_RESPONSE_BYTES`.
 const MAX_JSON_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// The `error` text of `aivyx-broker`'s `503` from `POST /gpu-lock/acquire`
+/// when its queue timeout elapses (`aivyx-broker/src/server.rs`).
+const BROKER_GPU_LOCK_TIMEOUT: &str = "timed out waiting for the GPU lock";
 
 /// How long `acquire()`/`release()` are allowed to take *overall* before
 /// giving up, as a mechanism distinct from a per-read timeout -- see
@@ -132,7 +134,29 @@ impl GpuLockClient {
             .map_err(classify_transport_error)?;
 
         if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-            return Err(GpuLockClientError::Timeout);
+            // Only the broker's own queue-timeout answer means "the GPU is
+            // busy". Any other 503 (a proxy, a different service on that
+            // port) is reported as what it is, not as a GPU-lock timeout.
+            let bytes = body_limits::read_capped_body(response, MAX_JSON_RESPONSE_BYTES)
+                .await
+                .map_err(map_capped_body_error)?;
+            #[derive(Deserialize)]
+            struct ErrorBody {
+                error: String,
+            }
+            return match serde_json::from_slice::<ErrorBody>(&bytes) {
+                Ok(body) if body.error == BROKER_GPU_LOCK_TIMEOUT => {
+                    Err(GpuLockClientError::Timeout)
+                }
+                _ => Err(GpuLockClientError::Transport(format!(
+                    "unexpected 503 from {} that is not aivyx-broker's GPU-lock timeout: {}",
+                    self.broker_url,
+                    String::from_utf8_lossy(&bytes)
+                        .chars()
+                        .take(200)
+                        .collect::<String>()
+                ))),
+            };
         }
         if !response.status().is_success() {
             return Err(GpuLockClientError::Transport(format!(
@@ -224,6 +248,25 @@ mod tests {
         let client = GpuLockClient::new(reqwest::Client::new(), broker.uri());
         let err = client.acquire().await.unwrap_err();
         assert!(matches!(err, GpuLockClientError::Timeout));
+    }
+
+    /// Audit 2026-11-11 X1/L4: a 503 from something that isn't the broker
+    /// (a proxy, another service) must not read as "the GPU is busy".
+    #[tokio::test]
+    async fn acquire_reports_a_foreign_503_as_transport_not_timeout() {
+        let broker = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/gpu-lock/acquire"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("Service Unavailable"))
+            .mount(&broker)
+            .await;
+
+        let client = GpuLockClient::new(reqwest::Client::new(), broker.uri());
+        let err = client.acquire().await.unwrap_err();
+        assert!(
+            matches!(&err, GpuLockClientError::Transport(m) if m.contains("not aivyx-broker")),
+            "got: {err:?}"
+        );
     }
 
     #[tokio::test]

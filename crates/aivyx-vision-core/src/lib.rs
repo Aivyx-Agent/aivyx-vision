@@ -4,8 +4,7 @@
 //! dependencies -- this crate must be safe for any backend crate
 //! (`aivyx-vision-mold`, and later `aivyx-vision-comfyui`) to depend on
 //! without pulling in an HTTP client or anything else backend-specific.
-//! See `aivyx-ecosystem/docs/superpowers/specs/
-//! 2026-09-18-aivyx-vision-v1-design.md` §4 for the full design.
+//! (The Aivyx-Vision v1 design, §4, has the full reasoning.)
 
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -65,6 +64,11 @@ pub struct GeneratedAsset {
     pub backend: String,
     pub seed_used: Option<u64>,
     pub generated_at: SystemTime,
+    /// Advisories the backend attached to an otherwise successful result,
+    /// such as mold adjusting the requested size. Empty when there were
+    /// none; a consumer should pass them on to the agent, which would
+    /// otherwise report what it asked for rather than what it got.
+    pub warnings: Vec<String>,
 }
 
 /// Everything that can go wrong generating an asset. Distinguishes
@@ -102,6 +106,11 @@ pub enum VisionError {
     /// what's wrong.
     #[error("local I/O failed: {0}")]
     Io(String),
+    /// A failure inside this crate or its backend client that is neither
+    /// the backend's nor the local filesystem's fault (for example, the
+    /// generation task panicked).
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 
 /// A test double for `GenerationProvider`: returns a canned result
@@ -184,6 +193,7 @@ mod tests {
                 backend: "fake".to_string(),
                 seed_used: Some(42),
                 generated_at: std::time::SystemTime::now(),
+                warnings: Vec::new(),
             })),
         );
         let asset = provider
@@ -208,6 +218,7 @@ mod tests {
             backend: "fake".to_string(),
             seed_used: None,
             generated_at: std::time::SystemTime::now(),
+            warnings: Vec::new(),
         }));
         provider
             .generate_image(ImageRequest {
@@ -251,6 +262,7 @@ mod tests {
             backend: "fake".to_string(),
             seed_used: None,
             generated_at: std::time::SystemTime::now(),
+            warnings: Vec::new(),
         }));
         let asset = provider
             .generate_3d(ThreeDRequest {

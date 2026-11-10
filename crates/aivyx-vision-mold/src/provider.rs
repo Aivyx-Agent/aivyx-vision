@@ -86,14 +86,17 @@ impl GenerationProvider for MoldProvider {
         let output_dir = self.output_dir.clone();
 
         let handle = tokio::spawn(async move {
+            // Built (and the reference image read) before the lock is
+            // taken: a bad path or an oversized file fails without a broker
+            // round trip, and the lock is never held for local file I/O.
+            let mold_req = tokio::task::spawn_blocking(move || build_mold_request(&req))
+                .await
+                .map_err(|e| {
+                    VisionError::Internal(format!("reading the reference image: {e}"))
+                })??;
+
             let lease = gpu_lock.acquire().await.map_err(map_gpu_lock_error)?;
-
-            let mold_req = build_mold_request(&req);
-            let result = match mold_req {
-                Ok(mold_req) => mold.generate(mold_req).await.map_err(map_mold_error),
-                Err(e) => Err(e),
-            };
-
+            let result = mold.generate(mold_req).await.map_err(map_mold_error);
             if let Err(e) = gpu_lock.release(&lease).await {
                 tracing::warn!(
                     error = %e,
@@ -102,12 +105,14 @@ impl GenerationProvider for MoldProvider {
             }
 
             let response = result?;
-            write_generated_asset(&output_dir, response)
+            tokio::task::spawn_blocking(move || write_generated_asset(&output_dir, response))
+                .await
+                .map_err(|e| VisionError::Internal(format!("writing the generated asset: {e}")))?
         });
 
-        handle.await.map_err(|e| {
-            VisionError::BackendUnreachable(format!("generation task panicked: {e}"))
-        })?
+        handle
+            .await
+            .map_err(|e| VisionError::Internal(format!("generation task panicked: {e}")))?
     }
 
     async fn generate_3d(&self, _req: ThreeDRequest) -> Result<GeneratedAsset, VisionError> {
@@ -120,11 +125,17 @@ impl GenerationProvider for MoldProvider {
 /// No redirects: a redirect would carry the `X-Api-Key` header (and the
 /// prompt, on 307/308) to whatever host the endpoint names, and hand the
 /// body of an arbitrary URL to the agent as "the generated image".
+///
+/// No proxy: `mold serve` and `aivyx-broker` are the operator's own local
+/// services, and reqwest otherwise sends even loopback requests -- with the
+/// prompt, the API key and any reference image -- to `HTTP_PROXY` /
+/// `ALL_PROXY` when one is set (audit 2026-11-11 X1).
 fn build_http_client() -> Result<reqwest::Client, VisionError> {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .read_timeout(MOLD_READ_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .build()
         .map_err(|e| VisionError::BackendUnreachable(format!("failed to build HTTP client: {e}")))
 }
@@ -172,21 +183,39 @@ fn build_mold_request(req: &ImageRequest) -> Result<GenerateImageRequest, Vision
     })
 }
 
+/// Writes the image as a new file only its owner can read: generated images
+/// can show private content. A directory this creates is owner-only too; an
+/// existing one keeps its permissions (in aivyx-coder it is the project's
+/// own `assets/generated/`). Unix only; elsewhere the platform defaults
+/// apply.
 fn write_generated_asset(
     output_dir: &Path,
     response: GenerateImageResponse,
 ) -> Result<GeneratedAsset, VisionError> {
-    std::fs::create_dir_all(output_dir)
+    let mut dir = std::fs::DirBuilder::new();
+    dir.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut dir, 0o700);
+    dir.create(output_dir)
         .map_err(|e| VisionError::Io(format!("creating output dir {output_dir:?}: {e}")))?;
     let ext = extension_for_content_type(&response.content_type);
     let path = output_dir.join(format!("{}.{ext}", uuid::Uuid::new_v4()));
-    std::fs::write(&path, &response.bytes)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let write = |options: &std::fs::OpenOptions| -> std::io::Result<()> {
+        use std::io::Write;
+        options.open(&path)?.write_all(&response.bytes)
+    };
+    write(&options)
         .map_err(|e| VisionError::Io(format!("writing generated asset {path:?}: {e}")))?;
     Ok(GeneratedAsset {
         path,
         backend: "mold".to_string(),
         seed_used: response.seed_used,
         generated_at: SystemTime::now(),
+        warnings: response.warnings,
     })
 }
 
@@ -400,7 +429,7 @@ mod tests {
             .and(path("/api/generate"))
             .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
                 "error": "inference crashed",
-                "code": "INFERENCE_FAILURE"
+                "code": "INFERENCE_ERROR"
             })))
             .mount(&mold)
             .await;
@@ -425,7 +454,11 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/gpu-lock/acquire"))
-            .respond_with(ResponseTemplate::new(503))
+            .respond_with(
+                ResponseTemplate::new(503).set_body_json(
+                    serde_json::json!({"error": "timed out waiting for the GPU lock"}),
+                ),
+            )
             .mount(&broker)
             .await;
         Mock::given(method("POST"))
@@ -560,6 +593,77 @@ mod tests {
         // this is the whole point of the test: release must still happen even
         // though nothing is left awaiting generate_image's own result.
         broker.verify().await;
+    }
+
+    /// Audit 2026-11-11 L1: an unreadable reference image fails before the
+    /// GPU lock is requested.
+    #[tokio::test]
+    async fn a_bad_reference_image_fails_without_touching_the_broker() {
+        let broker = MockServer::start().await;
+        let mold = MockServer::start().await;
+        let output_dir = tempfile::tempdir().unwrap();
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&broker)
+            .await;
+
+        let provider = test_provider(&broker, &mold, output_dir.path().to_path_buf()).await;
+        let err = provider
+            .generate_image(ImageRequest {
+                reference_image: Some(PathBuf::from("/nonexistent/ref.png")),
+                ..sample_image_request()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VisionError::Io(_)), "got: {err:?}");
+        broker.verify().await;
+    }
+
+    /// Audit 2026-11-11 L3/L6: a new output directory and file are
+    /// owner-only, and mold's request warning reaches the asset.
+    #[tokio::test]
+    async fn generated_files_are_owner_only_and_carry_molds_warning() {
+        let broker = MockServer::start().await;
+        let mold = MockServer::start().await;
+        let parent = tempfile::tempdir().unwrap();
+        let output_dir = parent.path().join("vision");
+        Mock::given(method("POST"))
+            .and(path("/gpu-lock/acquire"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"lease_id": "l-3"})),
+            )
+            .mount(&broker)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/gpu-lock/release"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&broker)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(vec![1, 2, 3])
+                    .insert_header("content-type", "image/png")
+                    .insert_header("x-mold-request-warning", "dimensions adjusted"),
+            )
+            .mount(&mold)
+            .await;
+
+        let provider = test_provider(&broker, &mold, output_dir.clone()).await;
+        let asset = provider
+            .generate_image(sample_image_request())
+            .await
+            .unwrap();
+        assert_eq!(asset.warnings, vec!["dimensions adjusted".to_string()]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&asset.path), 0o600);
+            assert_eq!(mode(&output_dir), 0o700);
+        }
     }
 
     #[test]

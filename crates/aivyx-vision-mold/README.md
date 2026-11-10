@@ -52,6 +52,14 @@ fall back to `bin`).
 
 ## Honest tradeoffs
 
+- **Never through a proxy.** The HTTP client is built with `no_proxy()`:
+  `mold serve` and `aivyx-broker` are local services, and reqwest would
+  otherwise send even loopback requests (prompt, API key, reference
+  image) to `HTTP_PROXY`/`ALL_PROXY`.
+- **Owner-only output.** A new output directory is created 0700 and each
+  file 0600 (Unix); an existing directory keeps its permissions.
+- **Not yet run against a real `mold serve`.** The client follows mold's
+  published API and is tested against mocks only.
 - **`mold serve` and `aivyx-broker` are both required-up dependencies**
   for `generate_image` to work at all — if either is down, the call fails
   with `VisionError::BackendUnreachable`, same trust model as this whole

@@ -69,6 +69,11 @@ pub struct GenerateImageResponse {
     pub bytes: Vec<u8>,
     pub content_type: String,
     pub seed_used: Option<u64>,
+    /// mold's `x-mold-request-warning` (all advisories, for example a size
+    /// adjusted to the model's grid), or its older
+    /// `x-mold-dimension-warning` when only that is sent. mold says not to
+    /// split the value on `;`, so it is kept whole.
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -177,6 +182,12 @@ impl MoldClient {
                 .get("x-mold-seed-used")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<u64>().ok());
+            let warnings = ["x-mold-request-warning", "x-mold-dimension-warning"]
+                .iter()
+                .find_map(|name| response.headers().get(*name))
+                .and_then(|v| v.to_str().ok())
+                .map(|s| vec![s.to_string()])
+                .unwrap_or_default();
             let bytes = body_limits::read_capped_body(response, MAX_IMAGE_RESPONSE_BYTES)
                 .await
                 .map_err(map_capped_body_error)?;
@@ -184,6 +195,7 @@ impl MoldClient {
                 bytes,
                 content_type,
                 seed_used,
+                warnings,
             });
         }
 
@@ -201,7 +213,18 @@ impl MoldClient {
         });
 
         match (status.as_u16(), body.code.as_deref()) {
-            (404, Some("MODEL_NOT_FOUND")) => Err(MoldClientError::ModelNotFound(body.error)),
+            (404, Some("MODEL_NOT_FOUND" | "UNKNOWN_MODEL")) => {
+                Err(MoldClientError::ModelNotFound(body.error))
+            }
+            (401, _) => Err(MoldClientError::BackendError {
+                status: 401,
+                code: body.code,
+                message: format!(
+                    "mold serve rejected the API key (set the mold api_key to one of the \
+                     server's MOLD_API_KEY values): {}",
+                    body.error
+                ),
+            }),
             (503, Some("QUEUE_FULL")) => Err(MoldClientError::QueueFull),
             _ => Err(MoldClientError::BackendError {
                 status: status.as_u16(),
@@ -298,6 +321,89 @@ mod tests {
         assert!(matches!(err, MoldClientError::ModelNotFound(msg) if msg.contains("flux-schnell")));
     }
 
+    /// mold's API reference lists `UNKNOWN_MODEL` beside `MODEL_NOT_FOUND`
+    /// for a model the host can't resolve (audit 2026-11-11 M1).
+    #[tokio::test]
+    async fn generate_maps_a_404_unknown_model_response_to_model_not_found() {
+        let mold = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": "unknown model nope:q8",
+                "code": "UNKNOWN_MODEL"
+            })))
+            .mount(&mold)
+            .await;
+
+        let client = MoldClient::new(reqwest::Client::new(), mold.uri(), None);
+        let err = client
+            .generate(GenerateImageRequest {
+                prompt: "anything".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MoldClientError::ModelNotFound(msg) if msg.contains("nope")));
+    }
+
+    #[tokio::test]
+    async fn generate_says_the_api_key_was_rejected_on_401() {
+        let mold = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": "missing X-Api-Key header",
+                "code": "UNAUTHORIZED"
+            })))
+            .mount(&mold)
+            .await;
+
+        let client = MoldClient::new(reqwest::Client::new(), mold.uri(), None);
+        let err = client
+            .generate(GenerateImageRequest {
+                prompt: "anything".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, MoldClientError::BackendError { status: 401, message, .. }
+                if message.contains("API key")),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_keeps_molds_request_warning_whole() {
+        let mold = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(vec![1, 2, 3])
+                    .insert_header("content-type", "image/png")
+                    .insert_header(
+                        "x-mold-request-warning",
+                        "dimensions adjusted from 1000x1000 to 1024x1024; steps clamped",
+                    ),
+            )
+            .mount(&mold)
+            .await;
+
+        let client = MoldClient::new(reqwest::Client::new(), mold.uri(), None);
+        let response = client
+            .generate(GenerateImageRequest {
+                prompt: "anything".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            response.warnings,
+            vec!["dimensions adjusted from 1000x1000 to 1024x1024; steps clamped".to_string()]
+        );
+    }
+
     #[tokio::test]
     async fn generate_maps_a_503_queue_full_response_to_a_named_error() {
         let mold = MockServer::start().await;
@@ -328,7 +434,7 @@ mod tests {
             .and(path("/api/generate"))
             .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
                 "error": "inference crashed",
-                "code": "INFERENCE_FAILURE"
+                "code": "INFERENCE_ERROR"
             })))
             .mount(&mold)
             .await;

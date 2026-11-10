@@ -6,8 +6,7 @@
 //! much smaller for `aivyx-broker`'s tiny JSON control-endpoint responses
 //! -- so a misbehaving or malicious server sending an unbounded body fails
 //! with a clear, typed error instead of growing this process's memory
-//! without limit. (Audit note: `~/aivyx-audit-2026-10-04/C-report.md`,
-//! item V7.)
+//! without limit. (Audit 2026-10-04, item V7.)
 
 /// A response body either exceeded its caller-supplied cap, or the
 /// underlying read itself failed partway through (a dropped connection,
