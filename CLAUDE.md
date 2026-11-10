@@ -51,14 +51,14 @@ target one crate. Single test: `cargo test <test_name>`.
   `aivyx-coder`'s `LlmBackend` — this crate must never depend on either
   product. A consuming product's adapter implements this trait by
   delegating to its own real provider.
-- `extract_svg_markup` — pure function, no I/O. Finds the first `<svg`
-  and last `</svg>` in a raw completion response and slices between them.
-  This tolerates a markdown code fence around the block, and prose that
-  doesn't itself mention `<svg>` before the real block; a response that
-  mentions `<svg` in prose ahead of the actual fenced block will fail
-  sanitization with an XML-parsing error rather than being correctly
-  extracted — a known, accepted limitation, not silently wrong (it fails
-  closed, never emits a truncated or wrong block).
+- `svg_candidates` / `extract_svg_markup` — pure functions, no I/O. They
+  list the blocks to try, best guess first: a ```` ```svg ```` fence's
+  contents, then first-`<svg`-to-last-`</svg>`, then each later `<svg`
+  start (to the last and to the next `</svg>`), capped at
+  `MAX_SVG_CANDIDATES`. `generate_svg` returns the first candidate that
+  sanitizes, else the first candidate's error. Every candidate goes
+  through the full sanitizer; this only picks the text (audit 2026-11-11
+  L5).
 - `sanitize_svg` — input limits (`MAX_SVG_INPUT_BYTES`, `MAX_SVG_DEPTH`;
   `svg-hush`'s pretty-printing is quadratic in depth), then the `svg-hush`
   crate's allowlist-based filter, then `restrict_to_in_document_content`,

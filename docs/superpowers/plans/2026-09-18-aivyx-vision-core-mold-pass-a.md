@@ -107,7 +107,7 @@ write-test/verify-fail with record-baseline/verify-no-regression.
 - [ ] **Step 1: Record the baseline**
 
 ```bash
-cd /home/julian/Projects/Rust/aivyx-vision
+cd aivyx-vision
 cargo test 2>&1 | tail -20
 ```
 
@@ -117,7 +117,7 @@ so Step 5 can be compared against it).
 - [ ] **Step 2: Move the crate into `crates/aivyx-vision-svg/`**
 
 ```bash
-cd /home/julian/Projects/Rust/aivyx-vision
+cd aivyx-vision
 mkdir -p crates/aivyx-vision-svg
 git mv src crates/aivyx-vision-svg/src
 git mv Cargo.toml crates/aivyx-vision-svg/Cargo.toml
@@ -137,12 +137,12 @@ resolver = "2"
 members = ["crates/*"]
 ```
 
-Save as `/home/julian/Projects/Rust/aivyx-vision/Cargo.toml`.
+Save as `aivyx-vision/Cargo.toml`.
 
 - [ ] **Step 4: Build the workspace**
 
 ```bash
-cd /home/julian/Projects/Rust/aivyx-vision
+cd aivyx-vision
 cargo build --workspace
 ```
 
@@ -152,7 +152,7 @@ workspace-level lock file.
 - [ ] **Step 5: Verify no regression**
 
 ```bash
-cd /home/julian/Projects/Rust/aivyx-vision
+cd aivyx-vision
 cargo test --workspace 2>&1 | tail -20
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
@@ -214,7 +214,7 @@ its three members.
 - [ ] **Step 8: Commit**
 
 ```bash
-cd /home/julian/Projects/Rust/aivyx-vision
+cd aivyx-vision
 git add -A
 git commit -m "chore: convert aivyx-vision into a Cargo workspace
 
@@ -358,7 +358,7 @@ fn vision_error_messages_are_specific_enough_to_act_on() {
 - [ ] **Step 2: Run to verify they fail**
 
 ```bash
-cd /home/julian/Projects/Rust/aivyx-vision
+cd aivyx-vision
 cargo test -p aivyx-vision-core -- --nocapture
 ```
 
@@ -574,7 +574,7 @@ Save as `crates/aivyx-vision-core/src/lib.rs`.
 - [ ] **Step 5: Run to verify they pass**
 
 ```bash
-cd /home/julian/Projects/Rust/aivyx-vision
+cd aivyx-vision
 cargo test -p aivyx-vision-core -- --nocapture
 ```
 
@@ -583,7 +583,7 @@ Expected: all 5 new tests pass.
 - [ ] **Step 6: Verify the `testing` feature compiles standalone**
 
 ```bash
-cd /home/julian/Projects/Rust/aivyx-vision
+cd aivyx-vision
 cargo build -p aivyx-vision-core --features testing
 ```
 
@@ -594,7 +594,7 @@ so it must compile outside of this crate's own `cfg(test)`.
 - [ ] **Step 7: Run full workspace check**
 
 ```bash
-cd /home/julian/Projects/Rust/aivyx-vision
+cd aivyx-vision
 cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
@@ -604,7 +604,7 @@ cargo fmt --check
 - [ ] **Step 8: Commit**
 
 ```bash
-cd /home/julian/Projects/Rust/aivyx-vision
+cd aivyx-vision
 git add -A
 git commit -m "feat: add aivyx-vision-core -- GenerationProvider trait, types, VisionError
 
@@ -719,7 +719,7 @@ async fn acquire_returns_transport_error_when_the_broker_is_unreachable() {
 - [ ] **Step 2: Run to verify they fail**
 
 ```bash
-cd /home/julian/Projects/Rust/aivyx-vision
+cd aivyx-vision
 cargo test -p aivyx-vision-mold -- --nocapture
 ```
 
@@ -889,7 +889,7 @@ Save as `crates/aivyx-vision-mold/src/lib.rs`.
 - [ ] **Step 6: Run to verify they pass**
 
 ```bash
-cd /home/julian/Projects/Rust/aivyx-vision
+cd aivyx-vision
 cargo test -p aivyx-vision-mold -- --nocapture
 ```
 
@@ -898,7 +898,7 @@ Expected: all 5 new tests pass.
 - [ ] **Step 7: Run full workspace check**
 
 ```bash
-cd /home/julian/Projects/Rust/aivyx-vision
+cd aivyx-vision
 cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
@@ -908,7 +908,7 @@ cargo fmt --check
 - [ ] **Step 8: Commit**
 
 ```bash
-cd /home/julian/Projects/Rust/aivyx-vision
+cd aivyx-vision
 git add -A
 git commit -m "feat: add aivyx-vision-mold's GpuLockClient
 
@@ -1092,7 +1092,7 @@ async fn generate_returns_transport_error_when_mold_is_unreachable() {
 - [ ] **Step 2: Run to verify they fail**
 
 ```bash
-cd /home/julian/Projects/Rust/aivyx-vision
+cd aivyx-vision
 cargo test -p aivyx-vision-mold mold_client -- --nocapture
 ```
 
@@ -1275,7 +1275,7 @@ Save as `crates/aivyx-vision-mold/src/lib.rs`.
 - [ ] **Step 5: Run to verify they pass**
 
 ```bash
-cd /home/julian/Projects/Rust/aivyx-vision
+cd aivyx-vision
 cargo test -p aivyx-vision-mold -- --nocapture
 ```
 
@@ -1284,7 +1284,7 @@ Expected: all 6 new tests pass (plus Task 3's 5, still green).
 - [ ] **Step 6: Run full workspace check**
 
 ```bash
-cd /home/julian/Projects/Rust/aivyx-vision
+cd aivyx-vision
 cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
@@ -1294,7 +1294,7 @@ cargo fmt --check
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /home/julian/Projects/Rust/aivyx-vision
+cd aivyx-vision
 git add -A
 git commit -m "feat: add aivyx-vision-mold's MoldClient
 
@@ -1538,7 +1538,7 @@ fn extension_for_content_type_maps_known_types_and_falls_back_to_bin() {
 - [ ] **Step 2: Run to verify they fail**
 
 ```bash
-cd /home/julian/Projects/Rust/aivyx-vision
+cd aivyx-vision
 cargo test -p aivyx-vision-mold provider -- --nocapture
 ```
 
@@ -1803,7 +1803,7 @@ Save as `crates/aivyx-vision-mold/src/lib.rs`.
 - [ ] **Step 6: Run to verify they pass**
 
 ```bash
-cd /home/julian/Projects/Rust/aivyx-vision
+cd aivyx-vision
 cargo test -p aivyx-vision-mold -- --nocapture
 ```
 
@@ -1912,7 +1912,7 @@ pass covering mold's async 3D job-lifecycle API).
 - [ ] **Step 10: Final full-workspace verification**
 
 ```bash
-cd /home/julian/Projects/Rust/aivyx-vision
+cd aivyx-vision
 cargo build --workspace
 cargo test --workspace 2>&1 | tail -40
 cargo clippy --workspace --all-targets -- -D warnings
@@ -1925,7 +1925,7 @@ passing, clippy/fmt clean.
 - [ ] **Step 11: Commit**
 
 ```bash
-cd /home/julian/Projects/Rust/aivyx-vision
+cd aivyx-vision
 git add -A
 git commit -m "feat: add aivyx-vision-mold's MoldProvider -- GenerationProvider impl
 
@@ -1944,7 +1944,7 @@ aivyx-ecosystem/docs/superpowers/specs/2026-09-18-aivyx-vision-v1-design.md."
 - [ ] Run the complete workspace test suite once, not per-task:
 
 ```bash
-cd /home/julian/Projects/Rust/aivyx-vision
+cd aivyx-vision
 cargo test --workspace 2>&1 | tail -40
 ```
 

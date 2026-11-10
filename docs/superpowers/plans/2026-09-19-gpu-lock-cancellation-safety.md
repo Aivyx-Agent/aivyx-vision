@@ -54,9 +54,9 @@ timing-sensitive regression test.
 ## Task 1: Detach `generate_image`'s GPU-lock sequence into a spawned task
 
 **Files:**
-- Modify: `/home/julian/Projects/Rust/aivyx-vision/crates/aivyx-vision-mold/Cargo.toml`
-- Modify: `/home/julian/Projects/Rust/aivyx-vision/crates/aivyx-vision-mold/src/provider.rs`
-- Modify: `/home/julian/Projects/Rust/aivyx-vision/crates/aivyx-vision-mold/README.md`
+- Modify: `aivyx-vision/crates/aivyx-vision-mold/Cargo.toml`
+- Modify: `aivyx-vision/crates/aivyx-vision-mold/src/provider.rs`
+- Modify: `aivyx-vision/crates/aivyx-vision-mold/README.md`
 
 **Interfaces:** none new — `MoldProvider::generate_image`'s public
 signature (`async fn generate_image(&self, req: ImageRequest) ->
@@ -128,7 +128,7 @@ async fn generate_image_releases_the_lease_even_when_the_caller_cancels_mid_gene
 - [ ] **Step 2: Run to verify it fails**
 
 ```bash
-cd /home/julian/Projects/Rust/aivyx-vision
+cd aivyx-vision
 cargo test -p aivyx-vision-mold generate_image_releases_the_lease_even_when_the_caller_cancels -- --nocapture
 ```
 
@@ -243,7 +243,7 @@ with:
 - [ ] **Step 5: Run to verify it passes**
 
 ```bash
-cd /home/julian/Projects/Rust/aivyx-vision
+cd aivyx-vision
 cargo test -p aivyx-vision-mold -- --nocapture
 ```
 
@@ -272,7 +272,7 @@ timeout/cancellation logic should know this:
 - [ ] **Step 7: Run full workspace verification**
 
 ```bash
-cd /home/julian/Projects/Rust/aivyx-vision
+cd aivyx-vision
 cargo build --workspace
 cargo test --workspace 2>&1 | tail -30
 cargo clippy --workspace --all-targets -- -D warnings
@@ -284,7 +284,7 @@ Expected: all green.
 - [ ] **Step 8: Commit**
 
 ```bash
-cd /home/julian/Projects/Rust/aivyx-vision
+cd aivyx-vision
 git add crates/aivyx-vision-mold/Cargo.toml crates/aivyx-vision-mold/src/provider.rs crates/aivyx-vision-mold/README.md
 git commit -m "fix: detach generate_image's GPU-lock sequence so caller cancellation can't leak or double-use the lease
 
@@ -318,7 +318,7 @@ Tokio runtime)."
   final, merged state):
 
 ```bash
-cd /home/julian/Projects/Rust/aivyx-vision
+cd aivyx-vision
 cargo test --workspace 2>&1 | tail -30
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check

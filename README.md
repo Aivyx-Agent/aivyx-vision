@@ -2,55 +2,53 @@
 
 [![License: BUSL-1.1](https://img.shields.io/badge/license-BUSL--1.1-blue.svg)](LICENSE)
 
-LLM-prompted SVG generation, sanitized before return — the first shipped
-slice of the Aivyx-Vision toolset (image and 3D model generation follow
-in later milestones; see the design doc below).
+Local-first generation as agent tool calls, shared by
+[Aivyx PA](https://github.com/Aivyx-Agent/aivyx-pa) and
+[aivyx-coder](https://github.com/Aivyx-Agent/aivyx-coder). A Cargo
+workspace with three crates:
 
-This repo is now a Cargo workspace — `crates/aivyx-vision-svg` (this
-crate), `crates/aivyx-vision-core`, and `crates/aivyx-vision-mold` are
-its three members.
+| Crate | What it does | Status |
+|---|---|---|
+| `aivyx-vision-svg` | Asks the caller's own model for an SVG and sanitizes it | Shipped |
+| `aivyx-vision-core` | The `GenerationProvider` trait, request and result types, `VisionError`; no I/O | Shipped |
+| `aivyx-vision-mold` | Image generation through an operator-run [`mold serve`](https://github.com/utensils/mold), sharing the GPU through [`aivyx-broker`](https://github.com/Aivyx-Agent/aivyx-broker)'s GPU lock | Images shipped, not yet run against a real `mold serve`; 3D not built |
+
+## SVG generation
 
 `generate_svg(completer, user_prompt)` prompts a caller-supplied
-`TextCompleter` — a minimal, product-agnostic seam this crate defines
-itself, not tied to any particular LLM provider — for SVG markup matching
-`user_prompt`, extracts the `<svg>...</svg>` block from the response
-(tolerating a markdown code fence around the block, and prose that
-doesn't itself mention `<svg>` before the real block — a response that
-mentions `<svg` in prose ahead of the actual fenced block will fail
-sanitization with an XML-parsing error rather than being correctly
-extracted, a known, accepted limitation, not silently wrong), and runs it
-through [`svg-hush`](https://docs.rs/svg-hush)'s allowlist-based sanitizer
-before returning the clean SVG source, then post-filters that output
-itself. Scripting and event-handler attributes are stripped outright; all
-CSS (`<style>` elements and `style` attributes) is removed, because
-`svg-hush` does not filter CSS fetch syntax such as `image-set()`; and
-every reference that does not point inside the document (anything other
-than a `#fragment` or an inline PNG/JPEG/GIF `data:` URL) is removed
-rather than rewritten to a same-origin path. Input over 256 KiB or nested
-deeper than 64 elements is rejected. This crate never returns unsanitized
+`TextCompleter` (a one-method seam this crate defines, so it depends on
+neither product) for SVG markup, picks the drawing out of the reply, and
+sanitizes it before returning it. This crate never returns unsanitized
 model output.
 
-The returned string is always a full XML document — it begins with an
-`<?xml version="1.0" encoding="utf-8"?>` processing instruction, not a
-bare `<svg>...</svg>` fragment, and it is not indented. A caller splicing
-this directly into an existing HTML document should strip the leading
-declaration first.
+- **Finding the drawing:** the contents of a ```` ```svg ```` fence are
+  tried first, then the reply's `<svg>…</svg>` blocks in order. The first
+  one that sanitizes is returned, so prose that mentions `<svg>` or a
+  second drawing doesn't break the call.
+- **Sanitizing:** [`svg-hush`](https://docs.rs/svg-hush)'s allowlist
+  removes scripting, event handlers and non-SVG elements. A second pass
+  then removes all CSS (`<style>` and `style` attributes), because
+  `svg-hush` doesn't filter CSS fetch syntax such as `image-set()`. It
+  also removes every reference that doesn't point inside the document;
+  only a `#fragment` or an inline PNG/JPEG/GIF `data:` URL is kept.
+- **Limits:** input over 256 KiB or nested deeper than 64 elements is
+  rejected.
+- **Output:** a full XML document starting with
+  `<?xml version="1.0" encoding="utf-8"?>`, not indented. Strip the
+  declaration before splicing it into HTML.
 
-Each consuming product implements `TextCompleter` with a few lines
-delegating to its own real, already-configured LLM provider — this crate
-has no dependency on `aivyx-pa` or `aivyx-coder` and never talks to a
-model itself.
+## Image generation
 
-See `aivyx-ecosystem/docs/superpowers/specs/2026-09-18-aivyx-vision-v1-design.md`
-for the full design and the two other planned milestones (image and 3D
-model generation).
+`MoldProvider` implements `GenerationProvider::generate_image` against
+`mold serve`'s `POST /api/generate`. It takes a GPU lease from the broker
+first and always releases it afterwards. It talks to both services
+directly, never through a proxy. Generated files are written owner-only.
+`generate_3d` returns `VisionError::Unsupported` for now. See
+[`crates/aivyx-vision-mold/README.md`](crates/aivyx-vision-mold/README.md)
+for configuration and trade-offs.
 
-## Milestone 2 (Pass A): image generation
+## Licence
 
-`crates/aivyx-vision-mold` implements `GenerationProvider::generate_image`
-against an operator-run [`mold serve`](https://github.com/utensils/mold)
-instance, coordinated with local LLM inference sharing the same GPU via
-[`aivyx-broker`](https://github.com/Aivyx-Agent/aivyx-broker)'s GPU lock.
-See `crates/aivyx-vision-mold/README.md` for configuration and status —
-`generate_3d` is not yet implemented (Pass B, a separate future build
-pass covering mold's async 3D job-lifecycle API).
+Source-available under BUSL-1.1: free for personal and other
+non-commercial use. See [`LICENSE`](LICENSE) and
+[`COMMERCIAL.md`](COMMERCIAL.md).
