@@ -300,7 +300,7 @@ fn fill_from_model(req: &mut GenerateImageRequest, model: &MoldModel) -> Vec<Str
         return Vec::new();
     }
     vec![format!(
-        "{} needs sizes in multiples of {}: generated {}x{} instead of the requested {}x{}",
+        "{} needs sizes in multiples of {}: generated {}x{} instead of {}x{}",
         model.name,
         align.unwrap_or(1),
         show(req.width),
@@ -413,9 +413,24 @@ fn write_generated_asset(
     options.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    // mold embeds the prompt and settings in the image by default; a
+    // prompt can be private and the file is often shared (live run
+    // 2026-11-11), so they don't reach the file.
+    let mut warnings = response.warnings;
+    let bytes = match crate::metadata::strip_metadata(&response.content_type, &response.bytes) {
+        Some(bytes) => bytes,
+        None => {
+            warnings.push(
+                "couldn't read the image to remove its embedded metadata; the file may \
+                 contain the prompt"
+                    .to_string(),
+            );
+            response.bytes
+        }
+    };
     let write = |options: &std::fs::OpenOptions| -> std::io::Result<()> {
         use std::io::Write;
-        options.open(&path)?.write_all(&response.bytes)
+        options.open(&path)?.write_all(&bytes)
     };
     write(&options)
         .map_err(|e| VisionError::Io(format!("writing generated asset {path:?}: {e}")))?;
@@ -424,7 +439,7 @@ fn write_generated_asset(
         backend: "mold".to_string(),
         seed_used: response.seed_used,
         generated_at: SystemTime::now(),
-        warnings: response.warnings,
+        warnings,
     })
 }
 
@@ -755,6 +770,15 @@ mod tests {
         assert_eq!(decoded, vec![1, 2, 3, 4]);
     }
 
+    /// A PNG this crate can parse: signature, header, end.
+    fn tiny_png() -> Vec<u8> {
+        let mut bytes = png_header(1, 1);
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        bytes.extend_from_slice(b"IEND");
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        bytes
+    }
+
     /// The start of a PNG: enough for its size to be read.
     fn png_header(width: u32, height: u32) -> Vec<u8> {
         let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13];
@@ -984,7 +1008,7 @@ mod tests {
             .and(path("/api/generate"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_bytes(vec![1, 2, 3])
+                    .set_body_bytes(tiny_png())
                     .insert_header("content-type", "image/png")
                     .insert_header("x-mold-request-warning", "dimensions adjusted"),
             )
@@ -1099,7 +1123,7 @@ mod tests {
         let notes = fill_from_model(&mut req, &model("flux2-klein:q8", "flux2", true));
         assert_eq!((req.width, req.height), (Some(496), Some(496)));
         assert!(
-            notes[0].contains("generated 496x496 instead of the requested 500x500"),
+            notes[0].contains("generated 496x496 instead of 500x500"),
             "{notes:?}"
         );
     }

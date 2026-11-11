@@ -81,6 +81,16 @@ fall back to `bin`).
   model's default size and lose the layout. `ImageRequest::strength`
   (0.0 keeps the reference, 1.0 ignores it; mold's default 0.75) is sent
   only with a reference, and dropped with a note without one.
+- **Embedded metadata is removed; mold's own copies are not.** mold
+  writes the prompt and every setting into each image it returns (on by
+  default in its container: `MOLD_EMBED_METADATA=1`). This crate strips
+  that text (PNG `tEXt`/`zTXt`/`iTXt`/`eXIf`/`tIME`; JPEG EXIF, XMP, IPTC
+  and comments) before writing the file, so a shared image doesn't carry
+  its prompt. mold itself still keeps a copy of every image in its
+  gallery (`~/.mold/output`, readable by other users of that machine in
+  the 0.37 container) and the prompts in its database (`~/.mold/mold.db`).
+  An operator who handles private prompts should run mold as its own
+  user with a private home, and clear the gallery as they see fit.
 - **`mold serve` and `aivyx-broker` are both required-up dependencies**
   for `generate_image` to work at all — if either is down, the call fails
   with `VisionError::BackendUnreachable`, same trust model as this whole

@@ -11,6 +11,7 @@
 
 mod body_limits;
 pub mod gpu_lock_client;
+mod metadata;
 pub mod mold_client;
 mod provider;
 

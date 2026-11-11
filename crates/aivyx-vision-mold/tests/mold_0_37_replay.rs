@@ -14,7 +14,9 @@
 //!   image-to-image takes `strength` (second live run, 2026-11-11).
 //!
 //! Recorded bodies are verbatim except the image itself: the real reply
-//! was a 512x512 PNG; a PNG signature stands in for it.
+//! was a 512x512 PNG. `fixtures/mold-0.37-no-pixels.png` is that reply with
+//! its pixel data (`IDAT`) cut out; the header and the text chunks mold
+//! embedded (prompt, model, settings) are byte for byte.
 
 use aivyx_vision_core::{GenerationProvider, ImageRequest, VisionError};
 use aivyx_vision_mold::{MoldConfig, MoldProvider};
@@ -29,7 +31,7 @@ const E401: &str = r#"{"error":"invalid API key","code":"UNAUTHORIZED"}"#;
 const E404: &str = r#"{"error":"deferred generation preparation failed: unknown model 'no-such-model:q8'. Run 'mold list' to see available models.","code":"UNKNOWN_MODEL","recovery":{"job_id":"5e9aa8e1-9deb-4b44-9e95-c55e1d9db8a5","batch_id":"ef74a7cc-e640-4551-8c89-180b468a71fe","retryable":true}}"#;
 const E422_MISSING: &str = "Failed to deserialize the JSON body into the target type: missing field `steps` at line 1 column 64";
 const E422_TOO_BIG: &str = r#"{"error":"2048x2048 = 4.19 megapixels exceeds the 1.8MP limit (VAE VRAM constraint)","code":"VALIDATION_ERROR"}"#;
-const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+const PNG: &[u8] = include_bytes!("fixtures/mold-0.37-no-pixels.png");
 
 async fn broker() -> MockServer {
     let broker = MockServer::start().await;
@@ -118,6 +120,14 @@ async fn a_generation_sends_what_mold_requires_and_reads_its_headers() {
     assert_eq!(asset.seed_used, Some(3));
     assert_eq!(asset.warnings, vec![WARNING.to_string()]);
     assert_eq!(asset.path.extension().unwrap(), "png");
+
+    // mold's embedded prompt and settings don't reach the file; the
+    // header does.
+    let written = std::fs::read(&asset.path).unwrap();
+    assert!(written.starts_with(&PNG[..33]), "signature and IHDR kept");
+    assert!(PNG.windows(5).any(|w| w == b"mold:"));
+    assert!(!written.windows(5).any(|w| w == b"mold:"), "{written:?}");
+    assert!(!written.windows(13).any(|w| w == b"brass compass"));
 }
 
 /// mold refuses 500x500 on flux2 ("must be multiples of 16"); the size is
@@ -142,7 +152,7 @@ async fn an_off_grid_size_is_rounded_before_mold_sees_it() {
         .await
         .unwrap();
     assert!(
-        asset.warnings[0].contains("496x496 instead of the requested 500x500"),
+        asset.warnings[0].contains("496x496 instead of 500x500"),
         "{:?}",
         asset.warnings
     );
