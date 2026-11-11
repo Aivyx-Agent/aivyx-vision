@@ -50,6 +50,7 @@ async fn generate_image_ignores_proxy_environment_variables() {
         mold_url: "http://127.0.0.1:9".to_string(),
         api_key: Some("secret-key".to_string()),
         output_dir: std::env::temp_dir(),
+        model: None,
     })
     .unwrap();
     let err = provider

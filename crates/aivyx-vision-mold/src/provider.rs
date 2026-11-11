@@ -21,7 +21,7 @@ use base64::Engine;
 
 use crate::gpu_lock_client::{GpuLockClient, GpuLockClientError};
 use crate::mold_client::{
-    GenerateImageRequest, GenerateImageResponse, MoldClient, MoldClientError,
+    GenerateImageRequest, GenerateImageResponse, MoldClient, MoldClientError, MoldModel,
 };
 
 /// `mold serve`'s own HTTP read timeout -- generation is real, wall-clock
@@ -37,12 +37,17 @@ pub struct MoldConfig {
     pub mold_url: String,
     pub api_key: Option<String>,
     pub output_dir: PathBuf,
+    /// The mold model to use (for example `flux2-klein:q8`). `None` uses
+    /// the image model that is downloaded on the server; see
+    /// [`resolve_model`].
+    pub model: Option<String>,
 }
 
 pub struct MoldProvider {
     gpu_lock: GpuLockClient,
     mold: MoldClient,
     output_dir: PathBuf,
+    model: Option<String>,
 }
 
 impl MoldProvider {
@@ -61,6 +66,7 @@ impl MoldProvider {
             gpu_lock: GpuLockClient::new(http.clone(), broker_url),
             mold: MoldClient::new(http, mold_url, config.api_key),
             output_dir: config.output_dir,
+            model: config.model,
         })
     }
 }
@@ -84,16 +90,23 @@ impl GenerationProvider for MoldProvider {
         let gpu_lock = self.gpu_lock.clone();
         let mold = self.mold.clone();
         let output_dir = self.output_dir.clone();
+        let configured_model = self.model.clone();
 
         let handle = tokio::spawn(async move {
             // Built (and the reference image read) before the lock is
             // taken: a bad path or an oversized file fails without a broker
             // round trip, and the lock is never held for local file I/O.
-            let mold_req = tokio::task::spawn_blocking(move || build_mold_request(&req))
+            let mut mold_req = tokio::task::spawn_blocking(move || build_mold_request(&req))
                 .await
                 .map_err(|e| {
                     VisionError::Internal(format!("reading the reference image: {e}"))
                 })??;
+            // mold 0.37 requires model, width, height and steps (found in the
+            // 2026-11-11 live run); fill whatever the caller left unset from
+            // the model's own defaults.
+            let models = mold.models().await.map_err(map_mold_error)?;
+            let (chosen, mut notes) = resolve_model(configured_model.as_deref(), &models)?;
+            notes.extend(fill_from_model(&mut mold_req, chosen));
 
             let lease = gpu_lock.acquire().await.map_err(map_gpu_lock_error)?;
             let result = mold.generate(mold_req).await.map_err(map_mold_error);
@@ -105,9 +118,15 @@ impl GenerationProvider for MoldProvider {
             }
 
             let response = result?;
-            tokio::task::spawn_blocking(move || write_generated_asset(&output_dir, response))
-                .await
-                .map_err(|e| VisionError::Internal(format!("writing the generated asset: {e}")))?
+            let mut asset =
+                tokio::task::spawn_blocking(move || write_generated_asset(&output_dir, response))
+                    .await
+                    .map_err(|e| {
+                        VisionError::Internal(format!("writing the generated asset: {e}"))
+                    })??;
+            notes.append(&mut asset.warnings);
+            asset.warnings = notes;
+            Ok(asset)
         });
 
         handle
@@ -159,6 +178,112 @@ fn read_reference_image(path: &Path) -> Result<Vec<u8>, VisionError> {
         )));
     }
     Ok(bytes)
+}
+
+/// Model families that make still images from a prompt. mold also serves
+/// video (`ltx-video`, `ltx2`, `wan`), 3D (`hunyuan3d`), upscalers,
+/// controlnets and prompt expanders, none of which `/api/generate` should
+/// get here.
+const IMAGE_FAMILIES: &[&str] = &[
+    "flux",
+    "flux2",
+    "qwen-image",
+    "qwen-image21",
+    "sd15",
+    "sd3",
+    "sdxl",
+    "wuerstchen",
+    "z-image",
+];
+
+/// Picks the model to generate with, and any note for the agent about the
+/// choice:
+///
+/// - a configured model must be one mold knows (it may not be downloaded
+///   yet: mold pulls on first use, which is slow, so that gets a note);
+/// - otherwise the downloaded image-family model; with several, the first
+///   by name, with a note saying how to choose.
+fn resolve_model<'a>(
+    configured: Option<&str>,
+    models: &'a [MoldModel],
+) -> Result<(&'a MoldModel, Vec<String>), VisionError> {
+    if let Some(name) = configured {
+        let model =
+            models
+                .iter()
+                .find(|m| m.name == name)
+                .ok_or_else(|| VisionError::BackendError {
+                    status: 404,
+                    code: Some("MODEL_NOT_FOUND".to_string()),
+                    message: format!("mold serve doesn't know the configured model {name:?}"),
+                })?;
+        let notes = if model.downloaded {
+            Vec::new()
+        } else {
+            vec![format!(
+                "mold had to download {name} before generating, so this took longer"
+            )]
+        };
+        return Ok((model, notes));
+    }
+    let mut candidates: Vec<&MoldModel> = models
+        .iter()
+        .filter(|m| m.downloaded && IMAGE_FAMILIES.contains(&m.family.as_str()))
+        .collect();
+    candidates.sort_by(|a, b| a.name.cmp(&b.name));
+    match candidates.as_slice() {
+        [] => Err(VisionError::BackendError {
+            status: 404,
+            code: Some("MODEL_NOT_FOUND".to_string()),
+            message: "mold serve has no image model downloaded; pull one (for example \
+                      `mold pull flux2-klein:q8`) or configure the model to use"
+                .to_string(),
+        }),
+        [only] => Ok((only, Vec::new())),
+        [first, ..] => Ok((
+            first,
+            vec![format!(
+                "several image models are downloaded on mold serve; used {} (configure the \
+                 model to choose another)",
+                first.name
+            )],
+        )),
+    }
+}
+
+/// Fills the fields mold requires from `model`'s defaults, keeping
+/// whatever the caller set, and rounds a requested size to the model's
+/// `dimension_alignment` (mold refuses anything else). Returns a note for
+/// the agent when it rounded.
+fn fill_from_model(req: &mut GenerateImageRequest, model: &MoldModel) -> Vec<String> {
+    req.model.get_or_insert_with(|| model.name.clone());
+    if req.steps.is_none() {
+        req.steps = model.default_steps;
+    }
+    let asked = (req.width, req.height);
+    let align = model.dimension_alignment.filter(|a| *a > 1);
+    let fit = |value: Option<u32>, default: Option<u32>| match (value, align) {
+        (Some(v), Some(a)) => Some(((v + a / 2) / a).max(1) * a),
+        (Some(v), None) => Some(v),
+        (None, _) => default,
+    };
+    req.width = fit(req.width, model.default_width);
+    req.height = fit(req.height, model.default_height);
+    let rounded_width = asked.0.is_some() && asked.0 != req.width;
+    let rounded_height = asked.1.is_some() && asked.1 != req.height;
+    if !rounded_width && !rounded_height {
+        return Vec::new();
+    }
+    let show = |v: Option<u32>| v.map_or("default".to_string(), |v| v.to_string());
+    vec![format!(
+        "{} needs sizes in multiples of {}: generated {}x{} instead of the requested {}x{}",
+        model.name,
+        align.unwrap_or(1),
+        show(req.width),
+        show(req.height),
+        show(asked.0),
+        show(asked.1),
+    )]
 }
 
 fn build_mold_request(req: &ImageRequest) -> Result<GenerateImageRequest, VisionError> {
@@ -341,11 +466,25 @@ mod tests {
         mold: &MockServer,
         output_dir: PathBuf,
     ) -> MoldProvider {
+        // Every generation asks mold for its models first (to fill the
+        // fields mold requires); one downloaded image model, as in the
+        // 2026-11-11 live run.
+        Mock::given(method("GET"))
+            .and(path("/api/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"name": "flux2-klein:q8", "family": "flux2", "downloaded": true,
+                 "default_steps": 4, "default_width": 1024, "default_height": 1024},
+                {"name": "ltx2:q8", "family": "ltx2", "downloaded": true,
+                 "default_steps": 8, "default_width": 768, "default_height": 512}
+            ])))
+            .mount(mold)
+            .await;
         MoldProvider::new(MoldConfig {
             broker_url: broker.uri(),
             mold_url: mold.uri(),
             api_key: None,
             output_dir,
+            model: None,
         })
         .unwrap()
     }
@@ -664,6 +803,144 @@ mod tests {
             assert_eq!(mode(&asset.path), 0o600);
             assert_eq!(mode(&output_dir), 0o700);
         }
+    }
+
+    fn model(name: &str, family: &str, downloaded: bool) -> MoldModel {
+        MoldModel {
+            name: name.to_string(),
+            family: family.to_string(),
+            downloaded,
+            default_steps: Some(4),
+            default_width: Some(1024),
+            default_height: Some(768),
+            dimension_alignment: Some(16),
+        }
+    }
+
+    /// Audit 2026-11-11 M1: with no model configured, the downloaded image
+    /// model is used; video, 3D and undownloaded models are skipped.
+    #[test]
+    fn resolve_model_picks_the_downloaded_image_model() {
+        let models = [
+            model("ltx2:q8", "ltx2", true),
+            model("hunyuan3d:q8", "hunyuan3d", true),
+            model("flux-schnell:q8", "flux", false),
+            model("flux2-klein:q8", "flux2", true),
+        ];
+        let (chosen, notes) = resolve_model(None, &models).unwrap();
+        assert_eq!(chosen.name, "flux2-klein:q8");
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn resolve_model_says_which_it_used_when_several_are_downloaded() {
+        let models = [
+            model("sdxl:q8", "sdxl", true),
+            model("flux2-klein:q8", "flux2", true),
+        ];
+        let (chosen, notes) = resolve_model(None, &models).unwrap();
+        assert_eq!(chosen.name, "flux2-klein:q8", "first by name");
+        assert!(notes[0].contains("several image models"), "{notes:?}");
+    }
+
+    #[test]
+    fn resolve_model_explains_when_no_image_model_is_downloaded() {
+        let models = [
+            model("ltx2:q8", "ltx2", true),
+            model("flux2-klein:q8", "flux2", false),
+        ];
+        let err = resolve_model(None, &models).unwrap_err().to_string();
+        assert!(err.contains("mold pull"), "{err}");
+    }
+
+    #[test]
+    fn resolve_model_honours_and_checks_a_configured_model() {
+        let models = [
+            model("flux2-klein:q8", "flux2", true),
+            model("sdxl:q8", "sdxl", false),
+        ];
+        let (chosen, notes) = resolve_model(Some("sdxl:q8"), &models).unwrap();
+        assert_eq!(chosen.name, "sdxl:q8");
+        assert!(notes[0].contains("download"), "{notes:?}");
+        let err = resolve_model(Some("nope:q8"), &models)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nope:q8"), "{err}");
+    }
+
+    #[test]
+    fn fill_from_model_keeps_the_callers_values() {
+        let mut req = GenerateImageRequest {
+            prompt: "x".to_string(),
+            width: Some(512),
+            ..Default::default()
+        };
+        let notes = fill_from_model(&mut req, &model("flux2-klein:q8", "flux2", true));
+        assert_eq!(req.model.as_deref(), Some("flux2-klein:q8"));
+        assert_eq!(
+            (req.width, req.height, req.steps),
+            (Some(512), Some(768), Some(4))
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    /// mold refuses sizes off the model's grid (2026-11-11 live run:
+    /// 500x500 on flux2 was a 422), so they are rounded, with a note.
+    #[test]
+    fn fill_from_model_rounds_an_off_grid_size_and_says_so() {
+        let mut req = GenerateImageRequest {
+            prompt: "x".to_string(),
+            width: Some(500),
+            height: Some(500),
+            ..Default::default()
+        };
+        let notes = fill_from_model(&mut req, &model("flux2-klein:q8", "flux2", true));
+        assert_eq!((req.width, req.height), (Some(496), Some(496)));
+        assert!(
+            notes[0].contains("generated 496x496 instead of the requested 500x500"),
+            "{notes:?}"
+        );
+    }
+
+    /// The fields mold 0.37 requires (model, width, height, steps) reach it.
+    #[tokio::test]
+    async fn generate_image_sends_every_field_mold_requires() {
+        let broker = MockServer::start().await;
+        let mold = MockServer::start().await;
+        let output_dir = tempfile::tempdir().unwrap();
+        Mock::given(method("POST"))
+            .and(path("/gpu-lock/acquire"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"lease_id": "l-4"})),
+            )
+            .mount(&broker)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/gpu-lock/release"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&broker)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "prompt": "anything", "model": "flux2-klein:q8",
+                "width": 1024, "height": 1024, "steps": 4
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(vec![1, 2, 3])
+                    .insert_header("content-type", "image/png"),
+            )
+            .expect(1)
+            .mount(&mold)
+            .await;
+
+        let provider = test_provider(&broker, &mold, output_dir.path().to_path_buf()).await;
+        provider
+            .generate_image(sample_image_request())
+            .await
+            .unwrap();
+        mold.verify().await;
     }
 
     #[test]

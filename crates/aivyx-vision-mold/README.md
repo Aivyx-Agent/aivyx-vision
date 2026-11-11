@@ -42,6 +42,7 @@ let provider = MoldProvider::new(MoldConfig {
     mold_url: "http://127.0.0.1:7680".to_string(),
     api_key: None, // Some("...") if the mold instance has MOLD_API_KEY set
     output_dir: "/path/to/generated/assets".into(),
+    model: None, // or Some("flux2-klein:q8".to_string())
 })?;
 ```
 
@@ -58,8 +59,21 @@ fall back to `bin`).
   image) to `HTTP_PROXY`/`ALL_PROXY`.
 - **Owner-only output.** A new output directory is created 0700 and each
   file 0600 (Unix); an existing directory keeps its permissions.
-- **Not yet run against a real `mold serve`.** The client follows mold's
-  published API and is tested against mocks only.
+- **Tested against mold 0.37.** A real `mold serve` 0.37.0 (CUDA, RTX
+  4090, `flux2-klein:q8`) generated text-to-image and image-to-image
+  through this crate on 2026-11-11, with the broker's GPU lock; its
+  responses are replayed in CI (`tests/mold_0_37_replay.rs`).
+- **mold must accept plain HTTP from this client.** Since 0.3x, mold
+  serves plain HTTP only on its own machine's loopback; a mold in Docker
+  or on another machine must be started with `--allow-direct-api`
+  (`MOLD_ALLOW_DIRECT_API=1`), or every call gets a 426, which this crate
+  explains.
+- **Model and size.** mold requires `model`, `width`, `height` and
+  `steps`. `MoldConfig::model` picks the model; when it is `None`, the
+  image model downloaded on the server is used (video, 3D and other
+  families are skipped; with several, the first by name, with a note).
+  Unset fields take the model's defaults, and a requested size is rounded
+  to the model's grid (mold refuses others), with a note to the agent.
 - **`mold serve` and `aivyx-broker` are both required-up dependencies**
   for `generate_image` to work at all — if either is down, the call fails
   with `VisionError::BackendUnreachable`, same trust model as this whole

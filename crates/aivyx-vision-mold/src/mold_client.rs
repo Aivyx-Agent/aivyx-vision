@@ -27,6 +27,10 @@ pub(crate) const MAX_IMAGE_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 /// close to `MAX_IMAGE_RESPONSE_BYTES`.
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 
+/// `GET /api/models` lists every model mold knows (about 180 in 0.37,
+/// each with its generation profile): a few MiB at most.
+const MAX_MODELS_BODY_BYTES: usize = 16 * 1024 * 1024;
+
 /// How long `generate()` is allowed to take *overall* -- connecting,
 /// sending the request, and reading the full response body -- before it
 /// gives up, as a mechanism distinct from the HTTP client's own
@@ -199,39 +203,114 @@ impl MoldClient {
             });
         }
 
-        #[derive(Deserialize)]
-        struct ErrorBody {
-            error: String,
-            code: Option<String>,
+        Err(error_from_response(response).await)
+    }
+
+    /// Every model `mold serve` knows (`GET /api/models`), downloaded or
+    /// not, with its default size and step count.
+    pub async fn models(&self) -> Result<Vec<MoldModel>, MoldClientError> {
+        match tokio::time::timeout(self.overall_timeout, self.models_inner()).await {
+            Ok(result) => result,
+            Err(_) => Err(MoldClientError::Timeout),
         }
-        let error_bytes = body_limits::read_capped_body(response, MAX_ERROR_BODY_BYTES)
+    }
+
+    async fn models_inner(&self) -> Result<Vec<MoldModel>, MoldClientError> {
+        let mut builder = self.http.get(format!("{}/api/models", self.base_url));
+        if let Some(key) = &self.api_key {
+            builder = builder.header("X-Api-Key", key);
+        }
+        let response = builder.send().await.map_err(classify_transport_error)?;
+        if !response.status().is_success() {
+            return Err(error_from_response(response).await);
+        }
+        let bytes = body_limits::read_capped_body(response, MAX_MODELS_BODY_BYTES)
             .await
             .map_err(map_capped_body_error)?;
-        let body: ErrorBody = serde_json::from_slice(&error_bytes).unwrap_or(ErrorBody {
-            error: "(no error body)".to_string(),
+        serde_json::from_slice(&bytes).map_err(|e| MoldClientError::BackendError {
+            status: 200,
             code: None,
-        });
+            message: format!("mold serve's model list was not understood: {e}"),
+        })
+    }
+}
 
-        match (status.as_u16(), body.code.as_deref()) {
-            (404, Some("MODEL_NOT_FOUND" | "UNKNOWN_MODEL")) => {
-                Err(MoldClientError::ModelNotFound(body.error))
-            }
-            (401, _) => Err(MoldClientError::BackendError {
-                status: 401,
-                code: body.code,
-                message: format!(
-                    "mold serve rejected the API key (set the mold api_key to one of the \
-                     server's MOLD_API_KEY values): {}",
-                    body.error
-                ),
-            }),
-            (503, Some("QUEUE_FULL")) => Err(MoldClientError::QueueFull),
-            _ => Err(MoldClientError::BackendError {
-                status: status.as_u16(),
-                code: body.code,
-                message: body.error,
-            }),
+/// One entry of `GET /api/models` -- only the fields this crate uses.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MoldModel {
+    pub name: String,
+    #[serde(default)]
+    pub family: String,
+    #[serde(default)]
+    pub downloaded: bool,
+    pub default_steps: Option<u32>,
+    pub default_width: Option<u32>,
+    pub default_height: Option<u32>,
+    /// Width and height must be multiples of this; mold refuses others
+    /// with a 422 (2026-11-11 live run: 500x500 on flux2).
+    pub dimension_alignment: Option<u32>,
+}
+
+/// Turns a non-2xx response into a typed error. mold answers most errors
+/// with JSON `{"error", "code"}`, but request-validation failures (a
+/// missing field, for example) as plain text; that text is kept rather
+/// than replaced with "(no error body)" (found in the 2026-11-11 live run).
+async fn error_from_response(response: reqwest::Response) -> MoldClientError {
+    #[derive(Deserialize)]
+    struct ErrorBody {
+        error: String,
+        code: Option<String>,
+    }
+    let status = response.status().as_u16();
+    let error_bytes = match body_limits::read_capped_body(response, MAX_ERROR_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(e) => return map_capped_body_error(e),
+    };
+    let body = serde_json::from_slice::<ErrorBody>(&error_bytes).unwrap_or_else(|_| {
+        let text = String::from_utf8_lossy(&error_bytes);
+        let text = text.trim();
+        ErrorBody {
+            error: if text.is_empty() {
+                "(no error body)".to_string()
+            } else {
+                text.chars().take(300).collect()
+            },
+            code: None,
         }
+    });
+
+    match (status, body.code.as_deref()) {
+        (404, Some("MODEL_NOT_FOUND" | "UNKNOWN_MODEL")) => {
+            MoldClientError::ModelNotFound(body.error)
+        }
+        // mold 0.3x's Secure mode: plain HTTP is accepted only on its
+        // private loopback engine, or when the server opts in. Found in
+        // the 2026-11-11 live run against mold 0.37 in Docker.
+        (426, _) => MoldClientError::BackendError {
+            status: 426,
+            code: body.code,
+            message: format!(
+                "mold serve only accepts plain-HTTP API calls on its own machine's loopback, \
+                 or when started with --allow-direct-api (MOLD_ALLOW_DIRECT_API=1); a mold \
+                 in Docker or on another machine needs that flag: {}",
+                body.error
+            ),
+        },
+        (401, _) => MoldClientError::BackendError {
+            status: 401,
+            code: body.code,
+            message: format!(
+                "mold serve rejected the API key (set the mold api_key to one of the \
+                 server's MOLD_API_KEY values): {}",
+                body.error
+            ),
+        },
+        (503, Some("QUEUE_FULL")) => MoldClientError::QueueFull,
+        _ => MoldClientError::BackendError {
+            status,
+            code: body.code,
+            message: body.error,
+        },
     }
 }
 
@@ -344,6 +423,62 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, MoldClientError::ModelNotFound(msg) if msg.contains("nope")));
+    }
+
+    /// The exact body mold 0.37 sent in the 2026-11-11 live run.
+    #[tokio::test]
+    async fn generate_explains_molds_secure_connection_requirement_on_426() {
+        let mold = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(426).set_body_json(serde_json::json!({
+                "error": "A secure Mold connection is required",
+                "code": "SECURE_CONNECTION_REQUIRED"
+            })))
+            .mount(&mold)
+            .await;
+
+        let client = MoldClient::new(reqwest::Client::new(), mold.uri(), None);
+        let err = client
+            .generate(GenerateImageRequest {
+                prompt: "anything".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, MoldClientError::BackendError { status: 426, message, .. }
+                if message.contains("--allow-direct-api")),
+            "got: {err:?}"
+        );
+    }
+
+    /// mold sends request-validation failures as plain text (2026-11-11
+    /// live run); the text must reach the caller.
+    #[tokio::test]
+    async fn generate_keeps_a_plain_text_error_body() {
+        let mold = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(422).set_body_string(
+                "Failed to deserialize the JSON body into the target type: missing field `steps`",
+            ))
+            .mount(&mold)
+            .await;
+
+        let client = MoldClient::new(reqwest::Client::new(), mold.uri(), None);
+        let err = client
+            .generate(GenerateImageRequest {
+                prompt: "anything".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, MoldClientError::BackendError { status: 422, message, .. }
+                if message.contains("missing field `steps`")),
+            "got: {err:?}"
+        );
     }
 
     #[tokio::test]

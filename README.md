@@ -11,7 +11,7 @@ workspace with three crates:
 |---|---|---|
 | `aivyx-vision-svg` | Asks the caller's own model for an SVG and sanitizes it | Shipped |
 | `aivyx-vision-core` | The `GenerationProvider` trait, request and result types, `VisionError`; no I/O | Shipped |
-| `aivyx-vision-mold` | Image generation through an operator-run [`mold serve`](https://github.com/utensils/mold), sharing the GPU through [`aivyx-broker`](https://github.com/Aivyx-Agent/aivyx-broker)'s GPU lock | Images shipped, not yet run against a real `mold serve`; 3D not built |
+| `aivyx-vision-mold` | Image generation through an operator-run [`mold serve`](https://github.com/utensils/mold), sharing the GPU through [`aivyx-broker`](https://github.com/Aivyx-Agent/aivyx-broker)'s GPU lock | Images shipped, tested against mold 0.37; 3D not built |
 
 ## SVG generation
 
