@@ -13,6 +13,9 @@ base64 = "0.22"
 # Reads a reference image's width and height from its header, so
 # image-to-image keeps the picture's shape (2026-11-11 live run).
 imagesize = "0.15"
+# Shrinks a generated image to a small JPEG a model can look at
+# (model_preview); only the decoders/encoders that needs.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

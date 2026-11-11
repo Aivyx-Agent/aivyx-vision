@@ -13,6 +13,7 @@ mod body_limits;
 pub mod gpu_lock_client;
 mod metadata;
 pub mod mold_client;
+pub mod preview;
 mod provider;
 
 pub use gpu_lock_client::{GpuLockClient, GpuLockClientError, LeaseId};
