@@ -21,8 +21,8 @@ use base64::Engine;
 
 use crate::gpu_lock_client::{GpuLockClient, GpuLockClientError};
 use crate::mold_client::{
-    GenerateImageRequest, GenerateImageResponse, MoldClient, MoldClientError, MoldModel,
-    UpscaleImageRequest,
+    GenerateImageRequest, GenerateImageResponse, MeshOptions, MoldClient, MoldClientError,
+    MoldModel, UpscaleImageRequest,
 };
 
 /// `mold serve`'s own HTTP read timeout -- generation is real, wall-clock
@@ -187,10 +187,77 @@ impl GenerationProvider for MoldProvider {
             .map_err(|e| VisionError::Internal(format!("upscale task panicked: {e}")))?
     }
 
-    async fn generate_3d(&self, _req: ThreeDRequest) -> Result<GeneratedAsset, VisionError> {
-        Err(VisionError::Unsupported(
-            "3D generation via mold (Pass B is not yet implemented)",
-        ))
+    /// A mesh from one image with mold's Hunyuan3D model, through the same
+    /// synchronous `/api/generate` (2026-11-11 live run: image to binary
+    /// glTF in 26-62 s). Without a reference image, `generate_image` makes
+    /// one from the prompt first, nudged towards a single object on a plain
+    /// background, and that image is kept beside the mesh.
+    async fn generate_3d(&self, req: ThreeDRequest) -> Result<GeneratedAsset, VisionError> {
+        let mut notes = Vec::new();
+        let source = match &req.reference_image {
+            Some(path) => path.clone(),
+            None => {
+                let image = self
+                    .generate_image(ImageRequest {
+                        prompt: format!("{}, {MESH_IMAGE_HINT}", req.prompt),
+                        style_hint: req.style_hint.clone(),
+                        seed: req.seed,
+                        ..Default::default()
+                    })
+                    .await?;
+                notes.push(format!(
+                    "made from a generated image of the object, saved as {}",
+                    image.path.display()
+                ));
+                image.path
+            }
+        };
+        let gpu_lock = self.gpu_lock.clone();
+        let mold = self.mold.clone().with_overall_timeout(MESH_TIMEOUT);
+        let output_dir = self.output_dir.clone();
+        let prompt = req.prompt.clone();
+        let seed = req.seed;
+        let handle = tokio::spawn(async move {
+            let bytes = tokio::task::spawn_blocking(move || read_mesh_source(&source))
+                .await
+                .map_err(|e| VisionError::Internal(format!("reading the image: {e}")))??;
+            let models = mold.models().await.map_err(map_mold_error)?;
+            let (model, model_notes) = resolve_mesh_model(&models)?;
+            notes.extend(model_notes);
+            let mold_req = GenerateImageRequest {
+                prompt,
+                model: Some(model.name.clone()),
+                width: model.default_width,
+                height: model.default_height,
+                steps: model.default_steps,
+                seed,
+                source_image: Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
+                embed_metadata: Some(false),
+                mesh: Some(MeshOptions {
+                    target_faces: Some(MESH_TARGET_FACES),
+                }),
+                ..Default::default()
+            };
+            let lease = gpu_lock.acquire().await.map_err(map_gpu_lock_error)?;
+            let result = mold.generate(mold_req).await.map_err(map_mold_error);
+            if let Err(e) = gpu_lock.release(&lease).await {
+                tracing::warn!(
+                    error = %e,
+                    "gpu-lock release failed after mesh generation; aivyx-broker's reap_expired will eventually reclaim it"
+                );
+            }
+            let response = result?;
+            let mut asset =
+                tokio::task::spawn_blocking(move || write_generated_asset(&output_dir, response))
+                    .await
+                    .map_err(|e| VisionError::Internal(format!("writing the mesh: {e}")))??;
+            notes.append(&mut asset.warnings);
+            asset.warnings = notes;
+            Ok(asset)
+        });
+        handle
+            .await
+            .map_err(|e| VisionError::Internal(format!("mesh task panicked: {e}")))?
     }
 }
 
@@ -304,6 +371,48 @@ fn resolve_model<'a>(
     }
 }
 
+/// Added to the prompt of the image a mesh is made from: Hunyuan3D turns
+/// one object into a mesh, and mold removes a plain background itself.
+const MESH_IMAGE_HINT: &str =
+    "a single whole object, centred, plain white background, soft even lighting, no shadows";
+
+/// About as many triangles as mold's own default for a textured mesh;
+/// small enough to load in a browser or game engine.
+const MESH_TARGET_FACES: u32 = 40_000;
+
+/// The mesh call's deadline: 26-62 s in the live run, but a cold load is
+/// longer. Under aivyx-broker's default 15-minute GPU-lock hold.
+const MESH_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The 3D model to use: a downloaded Hunyuan3D model that takes one image
+/// (the `2mv` ones need named views), first by name, with a note when
+/// there were several.
+fn resolve_mesh_model(models: &[MoldModel]) -> Result<(&MoldModel, Vec<String>), VisionError> {
+    let mut candidates: Vec<&MoldModel> = models
+        .iter()
+        .filter(|m| m.downloaded && m.family == "hunyuan3d" && !m.name.contains("2mv"))
+        .collect();
+    candidates.sort_by(|a, b| a.name.cmp(&b.name));
+    match candidates.as_slice() {
+        [] => Err(VisionError::BackendError {
+            status: 404,
+            code: Some("MODEL_NOT_FOUND".to_string()),
+            message: "mold serve has no 3D model downloaded; pull one (for example \
+                      `mold pull hunyuan3d-mini-turbo:fp16`, 3.8 GB, under Tencent's \
+                      Hunyuan3D licence, which mold asks you to accept first)"
+                .to_string(),
+        }),
+        [only] => Ok((only, Vec::new())),
+        [first, ..] => Ok((
+            first,
+            vec![format!(
+                "several 3D models are downloaded on mold serve; used {}",
+                first.name
+            )],
+        )),
+    }
+}
+
 /// The upscale tile size: mold's default ran out of GPU memory beside a
 /// loaded LLM in the 2026-11-11 live run; 256 did not.
 const UPSCALE_TILE_SIZE: u32 = 256;
@@ -342,14 +451,7 @@ fn resolve_upscaler(models: &[MoldModel]) -> Result<String, VisionError> {
 /// Reads an image to upscale: PNG or JPEG (mold refuses others), at most
 /// [`MAX_UPSCALE_INPUT_PIXELS`].
 fn read_upscale_input(path: &Path) -> Result<Vec<u8>, VisionError> {
-    let bytes = read_reference_image(path)?;
-    let size = match imagesize::image_type(&bytes) {
-        Ok(imagesize::ImageType::Png | imagesize::ImageType::Jpeg) => {
-            imagesize::blob_size(&bytes).ok()
-        }
-        _ => None,
-    }
-    .ok_or_else(|| VisionError::InvalidRequest(format!("{path:?} is not a PNG or JPEG image")))?;
+    let (bytes, size) = read_png_or_jpeg(path)?;
     let pixels = size.width as u64 * size.height as u64;
     if pixels > MAX_UPSCALE_INPUT_PIXELS {
         return Err(VisionError::InvalidRequest(format!(
@@ -359,6 +461,23 @@ fn read_upscale_input(path: &Path) -> Result<Vec<u8>, VisionError> {
         )));
     }
     Ok(bytes)
+}
+
+/// Reads the image a mesh is made from: PNG or JPEG (mold refuses others).
+fn read_mesh_source(path: &Path) -> Result<Vec<u8>, VisionError> {
+    read_png_or_jpeg(path).map(|(bytes, _)| bytes)
+}
+
+fn read_png_or_jpeg(path: &Path) -> Result<(Vec<u8>, imagesize::ImageSize), VisionError> {
+    let bytes = read_reference_image(path)?;
+    let size = match imagesize::image_type(&bytes) {
+        Ok(imagesize::ImageType::Png | imagesize::ImageType::Jpeg) => {
+            imagesize::blob_size(&bytes).ok()
+        }
+        _ => None,
+    }
+    .ok_or_else(|| VisionError::InvalidRequest(format!("{path:?} is not a PNG or JPEG image")))?;
+    Ok((bytes, size))
 }
 
 /// Fills the fields mold requires from `model`'s defaults, keeping
@@ -578,6 +697,7 @@ fn extension_for_content_type(content_type: &str) -> &'static str {
         "image/png" => "png",
         "image/jpeg" => "jpg",
         "image/webp" => "webp",
+        "model/gltf-binary" => "glb",
         _ => "bin",
     }
 }
@@ -848,28 +968,154 @@ mod tests {
         mold.verify().await;
     }
 
+    /// A binary glTF stands in for the mesh: only the header matters here.
+    const GLB: &[u8] = b"glTF\x02\x00\x00\x00";
+
+    async fn mesh_mold(mold: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/api/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"name": "flux2-klein:q8", "family": "flux2", "downloaded": true,
+                 "default_steps": 4, "default_width": 1024, "default_height": 1024},
+                {"name": "hunyuan3d-2mv:fp16", "family": "hunyuan3d", "downloaded": true},
+                {"name": "hunyuan3d-mini-turbo:fp16", "family": "hunyuan3d", "downloaded": true,
+                 "default_steps": 5, "default_width": 1022, "default_height": 1022,
+                 "dimension_alignment": 1, "max_pixels": 0}
+            ])))
+            .mount(mold)
+            .await;
+        // The 2026-11-11 live run's reply headers for a decimated mesh.
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "model": "hunyuan3d-mini-turbo:fp16", "width": 1022, "height": 1022,
+                "steps": 5, "embed_metadata": false, "mesh": {"target_faces": 40000}
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(GLB, "model/gltf-binary")
+                    .insert_header("x-mold-seed-used", "1")
+                    .insert_header("x-mold-mesh-format", "glb")
+                    .insert_header("x-mold-mesh-faces", "40000")
+                    .insert_header("x-mold-mesh-vertices", "13602")
+                    .insert_header("x-mold-mesh-textured", "false"),
+            )
+            .expect(1)
+            .mount(mold)
+            .await;
+    }
+
+    fn mesh_provider(broker: &MockServer, mold: &MockServer, dir: &Path) -> MoldProvider {
+        MoldProvider::new(MoldConfig {
+            broker_url: broker.uri(),
+            mold_url: mold.uri(),
+            api_key: None,
+            output_dir: dir.to_path_buf(),
+            model: None,
+        })
+        .unwrap()
+    }
+
     #[tokio::test]
-    async fn generate_3d_returns_unsupported_without_touching_the_network() {
+    async fn generate_3d_from_a_reference_image_writes_a_glb() {
         let broker = MockServer::start().await;
         let mold = MockServer::start().await;
-        let output_dir = tempfile::tempdir().unwrap();
-        // No mocks registered on either server at all -- if generate_3d ever
-        // made a real request, wiremock's default unmatched-request behavior
-        // would surface it as a connection-level response mismatch, but we
-        // don't even need that: the assertion below is on the error variant
-        // alone, and this crate's own generate_3d body (Step 3) never
-        // constructs a request in the first place.
-        let provider = test_provider(&broker, &mold, output_dir.path().to_path_buf()).await;
+        let dir = tempfile::tempdir().unwrap();
+        mock_lock(&broker).await;
+        mesh_mold(&mold).await;
+        let image = dir.path().join("lantern.png");
+        std::fs::write(&image, tiny_png()).unwrap();
 
-        let err = provider
+        let asset = mesh_provider(&broker, &mold, &dir.path().join("out"))
             .generate_3d(ThreeDRequest {
-                prompt: "a small statue".to_string(),
-                reference_image: None,
-                style_hint: None,
+                prompt: "a brass lantern".to_string(),
+                reference_image: Some(image),
+                ..Default::default()
             })
             .await
-            .unwrap_err();
-        assert!(matches!(err, VisionError::Unsupported(_)));
+            .unwrap();
+        assert_eq!(asset.path.extension().unwrap(), "glb");
+        assert_eq!(std::fs::read(&asset.path).unwrap(), GLB);
+        assert_eq!(
+            asset.warnings,
+            vec!["mesh: 40000 faces, untextured (geometry only)".to_string()]
+        );
+        mold.verify().await;
+    }
+
+    /// From a prompt, an image of the object is made first (with the hint
+    /// towards one object on a plain background) and kept.
+    #[tokio::test]
+    async fn generate_3d_from_a_prompt_makes_the_image_first() {
+        let broker = MockServer::start().await;
+        let mold = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        Mock::given(method("POST"))
+            .and(path("/gpu-lock/acquire"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"lease_id": "l-3d"})),
+            )
+            .mount(&broker)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/gpu-lock/release"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(2)
+            .mount(&broker)
+            .await;
+        mesh_mold(&mold).await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "model": "flux2-klein:q8",
+                "prompt": format!("a brass lantern, {MESH_IMAGE_HINT}, low poly")
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(tiny_png(), "image/png"))
+            .expect(1)
+            .mount(&mold)
+            .await;
+
+        let asset = mesh_provider(&broker, &mold, dir.path())
+            .generate_3d(ThreeDRequest {
+                prompt: "a brass lantern".to_string(),
+                style_hint: Some("low poly".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(asset.path.extension().unwrap(), "glb");
+        assert!(
+            asset.warnings[0].starts_with("made from a generated image of the object, saved as "),
+            "{:?}",
+            asset.warnings
+        );
+        mold.verify().await;
+        broker.verify().await;
+    }
+
+    #[test]
+    fn resolve_mesh_model_skips_multiview_models_and_says_how_to_get_one() {
+        let m = |name: &str, family: &str, downloaded| MoldModel {
+            name: name.to_string(),
+            family: family.to_string(),
+            downloaded,
+            default_steps: None,
+            default_width: None,
+            default_height: None,
+            dimension_alignment: None,
+            max_pixels: None,
+        };
+        let models = [
+            m("hunyuan3d-2mv:fp16", "hunyuan3d", true),
+            m("hunyuan3d-turbo:fp16", "hunyuan3d", false),
+            m("hunyuan3d-mini-turbo:fp16", "hunyuan3d", true),
+        ];
+        let (chosen, notes) = resolve_mesh_model(&models).unwrap();
+        assert_eq!(chosen.name, "hunyuan3d-mini-turbo:fp16");
+        assert!(notes.is_empty(), "{notes:?}");
+        let err = resolve_mesh_model(&models[..2]).unwrap_err().to_string();
+        assert!(err.contains("mold pull hunyuan3d-mini-turbo:fp16"), "{err}");
+        assert!(err.contains("licence"), "{err}");
     }
 
     #[test]
@@ -1520,6 +1766,7 @@ mod tests {
     fn extension_for_content_type_maps_known_types_and_falls_back_to_bin() {
         assert_eq!(extension_for_content_type("image/png"), "png");
         assert_eq!(extension_for_content_type("image/jpeg"), "jpg");
+        assert_eq!(extension_for_content_type("model/gltf-binary"), "glb");
         assert_eq!(
             extension_for_content_type("application/octet-stream"),
             "bin"

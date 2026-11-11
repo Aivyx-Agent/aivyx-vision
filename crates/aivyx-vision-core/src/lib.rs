@@ -63,15 +63,16 @@ pub struct ImageRequest {
     pub style_hint: Option<String>,
 }
 
-/// Backend-agnostic 3D generation request. Deliberately minimal for now
-/// -- the real shape (image-to-3D reference handling, mesh format knobs,
-/// etc.) is plan-time work for the Pass B build that actually implements
-/// `generate_3d` against a real backend.
-#[derive(Debug, Clone)]
+/// Backend-agnostic 3D generation request: a mesh from a reference image
+/// of one object, or from a prompt (the backend makes the image first).
+#[derive(Debug, Clone, Default)]
 pub struct ThreeDRequest {
     pub prompt: String,
+    /// A local PNG or JPEG of the object to turn into a mesh. Without one,
+    /// the backend generates an image from `prompt` first.
     pub reference_image: Option<PathBuf>,
     pub style_hint: Option<String>,
+    pub seed: Option<u64>,
 }
 
 /// The most variations [`generate_variations`] makes in one call: each is a
@@ -469,6 +470,7 @@ mod tests {
                 prompt: "a small statue".to_string(),
                 reference_image: None,
                 style_hint: None,
+                seed: None,
             })
             .await
             .unwrap();

@@ -11,12 +11,11 @@ ecosystem already has with Ollama and ComfyUI.
 
 - `generate_image` — implemented (Pass A). Calls `mold serve`'s
   synchronous `POST /api/generate`.
-- `generate_3d` — **not yet implemented**, always returns
-  `VisionError::Unsupported`. `mold`'s 3D surface
-  (`POST /api/mesh-workflows`) is an async, durable job-lifecycle API
-  (create → poll/SSE → resume/cancel), a materially different integration
-  shape from the single synchronous call `generate_image` wraps —
-  deliberately deferred to its own build pass ("Pass B").
+- `upscale_image` — `POST /api/upscale`.
+- `generate_3d` — implemented: the same synchronous `POST /api/generate`
+  with a Hunyuan3D model and a source image, returning binary glTF. The
+  async `POST /api/mesh-workflows` job API turned out not to be needed
+  (2026-11-11 live run). See "3D" below.
 
 ## GPU coordination
 
@@ -103,6 +102,23 @@ fall back to `bin`).
   memory beside a loaded LLM). Inputs are capped at 1 megapixel, since
   4x makes them 16 times bigger. Asking `/api/generate` for an
   `upscale_model` hung mold 0.37, so this crate never does.
+- **3D (`generate_3d`)** turns one image into a mesh with mold's
+  Hunyuan3D model through the same synchronous `/api/generate` (no job
+  lifecycle needed: 26–62 s per mesh in the 2026-11-11 live run). With
+  `reference_image`, that image is used; it should show one whole object
+  on a plain background, since a busy background turns into stray
+  fragments. Without one, an image is generated from the prompt first,
+  steered to a single object on plain white, and kept beside the mesh.
+  The result is binary glTF (`.glb`), decimated to about 40,000 faces,
+  untextured (mold's texture stage needs a separate paint download). The
+  `2mv` models, which need named views, are skipped.
+- **Hunyuan3D's licence.** The weights are Tencent's, under the Tencent
+  Hunyuan 3D 2.0 Community License: it does not apply in the European
+  Union, the United Kingdom or South Korea, and a separate Tencent
+  licence is needed above 1 million monthly active users (Tencent claims
+  no rights in generated meshes). mold asks the operator to accept it
+  before downloading (`mold licenses accept tencent-hunyuan3d-2.0`). This
+  crate ships no weights; whoever runs mold accepts the terms.
 - **`mold serve` and `aivyx-broker` are both required-up dependencies**
   for `generate_image` to work at all — if either is down, the call fails
   with `VisionError::BackendUnreachable`, same trust model as this whole

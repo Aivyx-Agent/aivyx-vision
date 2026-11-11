@@ -83,6 +83,10 @@ pub struct GenerateImageRequest {
     /// `false` stops mold writing the prompt and settings into the image.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embed_metadata: Option<bool>,
+    /// Hunyuan3D options; only sent to a 3D model (mold refuses them for
+    /// an image model).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<MeshOptions>,
     /// `false` sends mold's own copy of the result straight to its trash
     /// (purged after `gallery.trash_retention_days`) instead of its
     /// gallery.
@@ -208,12 +212,30 @@ impl MoldClient {
                 .get("x-mold-seed-used")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<u64>().ok());
-            let warnings = ["x-mold-request-warning", "x-mold-dimension-warning"]
+            let header = |name: &str| {
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+            };
+            let mut warnings: Vec<String> = ["x-mold-request-warning", "x-mold-dimension-warning"]
                 .iter()
-                .find_map(|name| response.headers().get(*name))
-                .and_then(|v| v.to_str().ok())
-                .map(|s| vec![s.to_string()])
-                .unwrap_or_default();
+                .find_map(|name| header(name))
+                .into_iter()
+                .collect();
+            // A mesh reply describes itself in headers (2026-11-11 live run).
+            if let Some(faces) = header("x-mold-mesh-faces") {
+                let textured = header("x-mold-mesh-textured").as_deref() == Some("true");
+                warnings.push(format!(
+                    "mesh: {faces} faces, {}",
+                    if textured {
+                        "textured"
+                    } else {
+                        "untextured (geometry only)"
+                    }
+                ));
+            }
             let bytes = body_limits::read_capped_body(response, MAX_IMAGE_RESPONSE_BYTES)
                 .await
                 .map_err(map_capped_body_error)?;
@@ -268,6 +290,15 @@ pub struct UpscaleImageRequest {
     /// beside a loaded LLM in the live run, 256 did not.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tile_size: Option<u32>,
+}
+
+/// `GenerateRequest.mesh` in mold 0.37.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct MeshOptions {
+    /// Decimate to about this many triangles. mold's raw output is dense
+    /// (375,000 faces, 8.7 MB, for one object in the 2026-11-11 live run).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_faces: Option<u32>,
 }
 
 #[derive(Debug, Clone)]

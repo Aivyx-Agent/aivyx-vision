@@ -43,7 +43,9 @@ model output.
 `mold serve`'s `POST /api/generate`. It takes a GPU lease from the broker
 first and always releases it afterwards. It talks to both services
 directly, never through a proxy. Generated files are written owner-only.
-`generate_3d` returns `VisionError::Unsupported` for now. See
+`generate_3d` turns an image (or a prompt, via a generated image) into a
+`.glb` mesh with mold's Hunyuan3D model, whose licence excludes the EU,
+UK and South Korea. See
 [`crates/aivyx-vision-mold/README.md`](crates/aivyx-vision-mold/README.md)
 for configuration and trade-offs.
 

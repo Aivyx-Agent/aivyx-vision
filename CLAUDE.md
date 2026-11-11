@@ -13,8 +13,10 @@ output as agent tool calls. This is now a Cargo workspace: `crates/aivyx-vision-
 `crates/aivyx-vision-mold` (mold-backed image generation — Milestone 2
 Pass A shipped: `generate_image` via `mold serve`'s synchronous
 `/api/generate`, coordinated through `aivyx-broker`'s GPU lock;
-`generate_3d` returns `VisionError::Unsupported` until Pass B implements
-mold's async `/api/mesh-workflows` job-lifecycle surface). See
+`upscale_image` via mold's `/api/upscale`; `generate_3d` turns one image
+into a binary glTF mesh with mold's Hunyuan3D model through the same
+synchronous `/api/generate`, generating the image first from a prompt
+when there is no reference). See
 `README.md` and
 `aivyx-ecosystem/docs/superpowers/specs/2026-09-18-aivyx-vision-v1-design.md`
 for the full rationale — this file only covers what's specific to working
