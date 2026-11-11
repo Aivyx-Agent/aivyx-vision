@@ -20,12 +20,24 @@ use async_trait::async_trait;
 pub trait GenerationProvider: Send + Sync {
     async fn generate_image(&self, req: ImageRequest) -> Result<GeneratedAsset, VisionError>;
     async fn generate_3d(&self, req: ThreeDRequest) -> Result<GeneratedAsset, VisionError>;
+    /// Enlarges an existing image with the backend's upscaler, writing the
+    /// result as a new file. Backends without one keep this default.
+    async fn upscale_image(&self, _req: UpscaleRequest) -> Result<GeneratedAsset, VisionError> {
+        Err(VisionError::Unsupported("upscaling"))
+    }
+}
+
+/// An image to enlarge with [`GenerationProvider::upscale_image`].
+#[derive(Debug, Clone, Default)]
+pub struct UpscaleRequest {
+    /// A local PNG or JPEG file.
+    pub image: PathBuf,
 }
 
 /// Backend-agnostic image generation request. No mold-CLI-flag or
 /// ComfyUI-workflow-JSON details belong here -- each backend crate
 /// translates these fields into its own real request shape internally.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ImageRequest {
     pub prompt: String,
     /// A local file path to use for image-to-image generation, if the
@@ -42,6 +54,9 @@ pub struct ImageRequest {
     /// (keep it) to 1.0 (ignore it). `None` uses the backend's default.
     /// Ignored, with a warning, when there is no reference image.
     pub strength: Option<f32>,
+    /// Inpainting: a local mask image the same shape as `reference_image`
+    /// (white = repaint, black = keep). Needs `reference_image`.
+    pub mask_image: Option<PathBuf>,
     /// A free-text style nudge (e.g. "watercolor", "pixel art"). Backends
     /// with no discrete style parameter fold this into the prompt they
     /// actually send.
@@ -57,6 +72,45 @@ pub struct ThreeDRequest {
     pub prompt: String,
     pub reference_image: Option<PathBuf>,
     pub style_hint: Option<String>,
+}
+
+/// The most variations [`generate_variations`] makes in one call: each is a
+/// full generation holding the GPU.
+pub const MAX_VARIATIONS: usize = 4;
+
+/// Makes `count` (1 to [`MAX_VARIATIONS`]) images from one request, with
+/// consecutive seeds so each can be reproduced: `req.seed`, or the seed the
+/// first image used, plus 0, 1, 2... Generations run one after another;
+/// every result is returned, failures included, so one failure doesn't
+/// lose the others.
+pub async fn generate_variations(
+    provider: &dyn GenerationProvider,
+    req: ImageRequest,
+    count: usize,
+) -> Result<Vec<Result<GeneratedAsset, VisionError>>, VisionError> {
+    if !(1..=MAX_VARIATIONS).contains(&count) {
+        return Err(VisionError::InvalidRequest(format!(
+            "count must be between 1 and {MAX_VARIATIONS}, got {count}"
+        )));
+    }
+    let mut results = Vec::with_capacity(count);
+    let mut base = req.seed;
+    for i in 0..count as u64 {
+        let seed = base.map(|b| b.wrapping_add(i));
+        let result = provider
+            .generate_image(ImageRequest {
+                seed,
+                ..req.clone()
+            })
+            .await;
+        if base.is_none()
+            && let Ok(asset) = &result
+        {
+            base = asset.seed_used.map(|s| s.wrapping_sub(i));
+        }
+        results.push(result);
+    }
+    Ok(results)
 }
 
 /// The result of a successful generation: a file path plus metadata, not
@@ -138,16 +192,32 @@ pub struct FakeGenerationProvider {
     threed_result: std::sync::Mutex<Option<Result<GeneratedAsset, VisionError>>>,
     captured_image_request: std::sync::Mutex<Option<ImageRequest>>,
     captured_3d_request: std::sync::Mutex<Option<ThreeDRequest>>,
+    upscale_result: std::sync::Mutex<Option<Result<GeneratedAsset, VisionError>>>,
+    captured_upscale_request: std::sync::Mutex<Option<UpscaleRequest>>,
 }
 
 #[cfg(any(test, feature = "testing"))]
 impl FakeGenerationProvider {
+    pub fn with_upscale_result(result: Result<GeneratedAsset, VisionError>) -> Self {
+        let fake = Self::with_image_result(Err(VisionError::Internal(
+            "no image result configured".to_string(),
+        )));
+        *fake.upscale_result.lock().unwrap() = Some(result);
+        fake
+    }
+
+    pub fn captured_upscale_request(&self) -> Option<UpscaleRequest> {
+        self.captured_upscale_request.lock().unwrap().clone()
+    }
+
     pub fn with_image_result(result: Result<GeneratedAsset, VisionError>) -> Self {
         Self {
             image_result: std::sync::Mutex::new(Some(result)),
             threed_result: std::sync::Mutex::new(None),
             captured_image_request: std::sync::Mutex::new(None),
             captured_3d_request: std::sync::Mutex::new(None),
+            upscale_result: std::sync::Mutex::new(None),
+            captured_upscale_request: std::sync::Mutex::new(None),
         }
     }
 
@@ -157,6 +227,8 @@ impl FakeGenerationProvider {
             threed_result: std::sync::Mutex::new(Some(result)),
             captured_image_request: std::sync::Mutex::new(None),
             captured_3d_request: std::sync::Mutex::new(None),
+            upscale_result: std::sync::Mutex::new(None),
+            captured_upscale_request: std::sync::Mutex::new(None),
         }
     }
 
@@ -189,6 +261,15 @@ impl GenerationProvider for FakeGenerationProvider {
             .take()
             .expect("FakeGenerationProvider.generate_3d called with no 3d_result configured, or called more than once")
     }
+
+    async fn upscale_image(&self, req: UpscaleRequest) -> Result<GeneratedAsset, VisionError> {
+        *self.captured_upscale_request.lock().unwrap() = Some(req);
+        self.upscale_result
+            .lock()
+            .unwrap()
+            .take()
+            .expect("FakeGenerationProvider.upscale_image called with no upscale_result configured, or called more than once")
+    }
 }
 
 #[cfg(test)]
@@ -196,6 +277,107 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    /// Answers every call, using the requested seed or else 1000 + call
+    /// number, and records the seeds it was asked for.
+    struct SeedEcho {
+        asked: std::sync::Mutex<Vec<Option<u64>>>,
+        fail_call: Option<usize>,
+    }
+
+    #[async_trait]
+    impl GenerationProvider for SeedEcho {
+        async fn generate_image(&self, req: ImageRequest) -> Result<GeneratedAsset, VisionError> {
+            let mut asked = self.asked.lock().unwrap();
+            asked.push(req.seed);
+            let call = asked.len() - 1;
+            if self.fail_call == Some(call) {
+                return Err(VisionError::GenerationTimeout);
+            }
+            Ok(GeneratedAsset {
+                path: PathBuf::from(format!("/out/{call}.png")),
+                backend: "echo".to_string(),
+                seed_used: Some(req.seed.unwrap_or(1000 + call as u64)),
+                generated_at: SystemTime::UNIX_EPOCH,
+                warnings: Vec::new(),
+            })
+        }
+        async fn generate_3d(&self, _: ThreeDRequest) -> Result<GeneratedAsset, VisionError> {
+            Err(VisionError::Unsupported("3D"))
+        }
+    }
+
+    fn echo(fail_call: Option<usize>) -> SeedEcho {
+        SeedEcho {
+            asked: std::sync::Mutex::new(Vec::new()),
+            fail_call,
+        }
+    }
+
+    #[tokio::test]
+    async fn variations_use_consecutive_seeds_from_the_requested_one() {
+        let provider = echo(None);
+        let req = ImageRequest {
+            prompt: "a lantern".to_string(),
+            seed: Some(7),
+            ..Default::default()
+        };
+        let results = generate_variations(&provider, req, 3).await.unwrap();
+        assert_eq!(*provider.asked.lock().unwrap(), [Some(7), Some(8), Some(9)]);
+        let seeds: Vec<_> = results
+            .iter()
+            .map(|r| r.as_ref().unwrap().seed_used)
+            .collect();
+        assert_eq!(seeds, [Some(7), Some(8), Some(9)]);
+    }
+
+    #[tokio::test]
+    async fn without_a_seed_variations_continue_from_the_first_images_seed() {
+        let provider = echo(None);
+        let req = ImageRequest {
+            prompt: "a lantern".to_string(),
+            ..Default::default()
+        };
+        generate_variations(&provider, req, 3).await.unwrap();
+        assert_eq!(
+            *provider.asked.lock().unwrap(),
+            [None, Some(1001), Some(1002)]
+        );
+    }
+
+    #[tokio::test]
+    async fn one_failed_variation_keeps_the_others() {
+        let provider = echo(Some(1));
+        let req = ImageRequest {
+            prompt: "a lantern".to_string(),
+            seed: Some(7),
+            ..Default::default()
+        };
+        let results = generate_variations(&provider, req, 3).await.unwrap();
+        assert!(results[0].is_ok() && results[1].is_err() && results[2].is_ok());
+    }
+
+    #[tokio::test]
+    async fn upscaling_is_unsupported_unless_a_backend_provides_it() {
+        let err = echo(None)
+            .upscale_image(UpscaleRequest::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, VisionError::Unsupported("upscaling")),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn variations_refuse_a_count_outside_one_to_four() {
+        for count in [0, MAX_VARIATIONS + 1] {
+            let err = generate_variations(&echo(None), ImageRequest::default(), count)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, VisionError::InvalidRequest(_)), "{count}");
+        }
+    }
 
     #[tokio::test]
     async fn generation_provider_is_usable_as_a_trait_object() {
@@ -216,6 +398,7 @@ mod tests {
                 height: None,
                 seed: None,
                 strength: None,
+                mask_image: None,
                 style_hint: None,
             })
             .await
@@ -241,6 +424,7 @@ mod tests {
                 height: Some(512),
                 seed: None,
                 strength: None,
+                mask_image: None,
                 style_hint: Some("watercolor".to_string()),
             })
             .await
@@ -263,6 +447,7 @@ mod tests {
                 height: None,
                 seed: None,
                 strength: None,
+                mask_image: None,
                 style_hint: None,
             })
             .await

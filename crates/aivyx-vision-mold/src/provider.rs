@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use aivyx_vision_core::{
-    GeneratedAsset, GenerationProvider, ImageRequest, ThreeDRequest, VisionError,
+    GeneratedAsset, GenerationProvider, ImageRequest, ThreeDRequest, UpscaleRequest, VisionError,
 };
 use async_trait::async_trait;
 use base64::Engine;
@@ -22,6 +22,7 @@ use base64::Engine;
 use crate::gpu_lock_client::{GpuLockClient, GpuLockClientError};
 use crate::mold_client::{
     GenerateImageRequest, GenerateImageResponse, MoldClient, MoldClientError, MoldModel,
+    UpscaleImageRequest,
 };
 
 /// `mold serve`'s own HTTP read timeout -- generation is real, wall-clock
@@ -134,6 +135,56 @@ impl GenerationProvider for MoldProvider {
         handle
             .await
             .map_err(|e| VisionError::Internal(format!("generation task panicked: {e}")))?
+    }
+
+    /// Same detached acquire -> upscale -> release -> write shape as
+    /// `generate_image`, through mold's standalone `/api/upscale`. (Asking
+    /// `/api/generate` for `upscale_model` hung mold 0.37 in the 2026-11-11
+    /// live run, so upscaling is its own step.)
+    async fn upscale_image(&self, req: UpscaleRequest) -> Result<GeneratedAsset, VisionError> {
+        let gpu_lock = self.gpu_lock.clone();
+        let mold = self.mold.clone();
+        let output_dir = self.output_dir.clone();
+        let handle = tokio::spawn(async move {
+            let image = req.image.clone();
+            let bytes = tokio::task::spawn_blocking(move || read_upscale_input(&image))
+                .await
+                .map_err(|e| VisionError::Internal(format!("reading the image: {e}")))??;
+            let models = mold.models().await.map_err(map_mold_error)?;
+            let upscaler = resolve_upscaler(&models)?;
+            let lease = gpu_lock.acquire().await.map_err(map_gpu_lock_error)?;
+            let result = mold
+                .upscale(UpscaleImageRequest {
+                    model: upscaler.clone(),
+                    image: base64::engine::general_purpose::STANDARD.encode(bytes),
+                    tile_size: Some(UPSCALE_TILE_SIZE),
+                })
+                .await
+                .map_err(map_mold_error);
+            if let Err(e) = gpu_lock.release(&lease).await {
+                tracing::warn!(
+                    error = %e,
+                    "gpu-lock release failed after upscaling; aivyx-broker's reap_expired will eventually reclaim it"
+                );
+            }
+            let upscaled = result?;
+            let note = format!(
+                "upscaled with {upscaler} to {}x{}",
+                upscaled.width, upscaled.height
+            );
+            let response = GenerateImageResponse {
+                bytes: upscaled.bytes,
+                content_type: upscaled.content_type,
+                seed_used: None,
+                warnings: vec![note],
+            };
+            tokio::task::spawn_blocking(move || write_generated_asset(&output_dir, response))
+                .await
+                .map_err(|e| VisionError::Internal(format!("writing the upscaled image: {e}")))?
+        });
+        handle
+            .await
+            .map_err(|e| VisionError::Internal(format!("upscale task panicked: {e}")))?
     }
 
     async fn generate_3d(&self, _req: ThreeDRequest) -> Result<GeneratedAsset, VisionError> {
@@ -253,6 +304,63 @@ fn resolve_model<'a>(
     }
 }
 
+/// The upscale tile size: mold's default ran out of GPU memory beside a
+/// loaded LLM in the 2026-11-11 live run; 256 did not.
+const UPSCALE_TILE_SIZE: u32 = 256;
+
+/// The largest image (width x height) upscaling takes: 4x makes it 16
+/// times bigger, and mold returns it as JSON about three times the PNG's
+/// size.
+const MAX_UPSCALE_INPUT_PIXELS: u64 = 1024 * 1024;
+
+/// Upscalers that fail in mold 0.37: the x2plus weights don't load
+/// ("shape mismatch for conv_first.weight", 2026-11-11 live run).
+const BROKEN_UPSCALERS: &[&str] = &["real-esrgan-x2plus:fp16", "real-esrgan-x2plus:fp32"];
+
+/// The upscaler to use: `real-esrgan-x4plus` if downloaded, else any other
+/// downloaded upscaler that works (first by name).
+fn resolve_upscaler(models: &[MoldModel]) -> Result<String, VisionError> {
+    let mut upscalers: Vec<&str> = models
+        .iter()
+        .filter(|m| m.downloaded && m.family == "upscaler")
+        .map(|m| m.name.as_str())
+        .filter(|name| !BROKEN_UPSCALERS.contains(name))
+        .collect();
+    upscalers.sort_by_key(|name| (!name.starts_with("real-esrgan-x4plus:"), *name));
+    upscalers
+        .first()
+        .map(|name| name.to_string())
+        .ok_or_else(|| VisionError::BackendError {
+            status: 404,
+            code: Some("MODEL_NOT_FOUND".to_string()),
+            message: "mold serve has no working upscaler downloaded; pull one (for example \
+                      `mold pull real-esrgan-x4plus:fp16`, 31 MB)"
+                .to_string(),
+        })
+}
+
+/// Reads an image to upscale: PNG or JPEG (mold refuses others), at most
+/// [`MAX_UPSCALE_INPUT_PIXELS`].
+fn read_upscale_input(path: &Path) -> Result<Vec<u8>, VisionError> {
+    let bytes = read_reference_image(path)?;
+    let size = match imagesize::image_type(&bytes) {
+        Ok(imagesize::ImageType::Png | imagesize::ImageType::Jpeg) => {
+            imagesize::blob_size(&bytes).ok()
+        }
+        _ => None,
+    }
+    .ok_or_else(|| VisionError::InvalidRequest(format!("{path:?} is not a PNG or JPEG image")))?;
+    let pixels = size.width as u64 * size.height as u64;
+    if pixels > MAX_UPSCALE_INPUT_PIXELS {
+        return Err(VisionError::InvalidRequest(format!(
+            "{path:?} is {}x{}; upscaling takes images up to {MAX_UPSCALE_INPUT_PIXELS} \
+             pixels (for example 1024x1024), since 4x makes them 16 times bigger",
+            size.width, size.height
+        )));
+    }
+    Ok(bytes)
+}
+
 /// Fills the fields mold requires from `model`'s defaults, keeping
 /// whatever the caller set, and fits the size to what mold accepts for the
 /// model: a multiple of its `dimension_alignment`, and no more than its
@@ -330,6 +438,12 @@ fn build_mold_request(
         Some(hint) => format!("{}, {hint}", req.prompt),
         None => req.prompt.clone(),
     };
+    if req.mask_image.is_some() && req.reference_image.is_none() {
+        return Err(VisionError::InvalidRequest(
+            "mask_image needs a reference_image: the mask marks which parts of it to repaint"
+                .to_string(),
+        ));
+    }
     let (mut width, mut height) = (req.width, req.height);
     let mut strength = req.strength;
     let source_image = match &req.reference_image {
@@ -362,6 +476,13 @@ fn build_mold_request(
             None
         }
     };
+    let text_to_image = source_image.is_none();
+    let mask_image = match &req.mask_image {
+        Some(path) => {
+            Some(base64::engine::general_purpose::STANDARD.encode(read_reference_image(path)?))
+        }
+        None => None,
+    };
     Ok((
         GenerateImageRequest {
             prompt,
@@ -369,7 +490,16 @@ fn build_mold_request(
             height,
             seed: req.seed,
             source_image,
+            mask_image,
             strength,
+            // mold otherwise embeds the prompt in the image and keeps a
+            // gallery copy (2026-11-11 live run). `save_to_gallery: false`
+            // sends its copy straight to its trash, but only without a
+            // source image: with one, mold 0.37 logs a "source-media
+            // handoff failure" and wedged once, so image-to-image results
+            // stay in its gallery.
+            save_to_gallery: text_to_image.then_some(false),
+            embed_metadata: Some(false),
             ..Default::default()
         },
         notes,
@@ -596,6 +726,7 @@ mod tests {
             height: None,
             seed: None,
             strength: None,
+            mask_image: None,
             style_hint: None,
         }
     }
@@ -893,6 +1024,184 @@ mod tests {
                 "{strength}: {err}"
             );
         }
+    }
+
+    /// mold keeps a gallery copy of every image and embeds the prompt in
+    /// it unless told not to (2026-11-11 live run); every request says so.
+    #[test]
+    fn build_mold_request_asks_mold_not_to_keep_or_embed_anything() {
+        let (mold_req, _) = build_mold_request(&sample_image_request()).unwrap();
+        assert_eq!(mold_req.embed_metadata, Some(false));
+        assert_eq!(mold_req.save_to_gallery, Some(false));
+    }
+
+    /// With a source image, `save_to_gallery: false` made mold 0.37 log a
+    /// "source-media handoff failure" on every request and wedge once
+    /// (live run 2026-11-11), so it isn't sent then.
+    #[test]
+    fn build_mold_request_leaves_the_gallery_alone_for_image_to_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mold_req, _) = build_mold_request(&reference_request(dir.path(), 8, 8)).unwrap();
+        assert_eq!(mold_req.embed_metadata, Some(false));
+        assert_eq!(mold_req.save_to_gallery, None);
+    }
+
+    #[test]
+    fn build_mold_request_refuses_a_mask_without_a_reference_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let mask = dir.path().join("mask.png");
+        std::fs::write(&mask, png_header(8, 8)).unwrap();
+        let req = ImageRequest {
+            mask_image: Some(mask),
+            ..sample_image_request()
+        };
+        let err = build_mold_request(&req).unwrap_err();
+        assert!(matches!(err, VisionError::InvalidRequest(_)), "{err}");
+    }
+
+    #[test]
+    fn build_mold_request_base64_encodes_the_mask_beside_the_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let mask = dir.path().join("mask.png");
+        std::fs::write(&mask, png_header(8, 8)).unwrap();
+        let req = ImageRequest {
+            mask_image: Some(mask),
+            ..reference_request(dir.path(), 8, 8)
+        };
+        let (mold_req, _) = build_mold_request(&req).unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(mold_req.mask_image.unwrap())
+            .unwrap();
+        assert_eq!(decoded, png_header(8, 8));
+        assert!(mold_req.source_image.is_some());
+    }
+
+    #[test]
+    fn resolve_upscaler_prefers_x4plus_skips_broken_ones_and_says_how_to_get_one() {
+        let up = |name: &str, downloaded| MoldModel {
+            name: name.to_string(),
+            family: "upscaler".to_string(),
+            downloaded,
+            default_steps: None,
+            default_width: None,
+            default_height: None,
+            dimension_alignment: None,
+            max_pixels: None,
+        };
+        let models = [
+            model("flux2-klein:q8", "flux2", true),
+            up("real-esrgan-anime-v3:fp32", true),
+            up("real-esrgan-x4plus:fp16", true),
+            up("real-esrgan-x2plus:fp16", true),
+        ];
+        assert_eq!(
+            resolve_upscaler(&models).unwrap(),
+            "real-esrgan-x4plus:fp16"
+        );
+        assert_eq!(
+            resolve_upscaler(&[models[1].clone(), models[3].clone()]).unwrap(),
+            "real-esrgan-anime-v3:fp32"
+        );
+        let err = resolve_upscaler(&[models[0].clone(), models[3].clone()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mold pull real-esrgan-x4plus:fp16"), "{err}");
+    }
+
+    async fn mock_lock(broker: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/gpu-lock/acquire"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"lease_id": "l-up"})),
+            )
+            .mount(broker)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/gpu-lock/release"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(broker)
+            .await;
+    }
+
+    /// The reply shape mold 0.37's `/api/upscale` gave in the live run: the
+    /// image as an array of byte values. The PNG carries a text chunk, which
+    /// must not reach the file.
+    #[tokio::test]
+    async fn upscale_image_uses_the_x4_upscaler_and_writes_a_clean_file() {
+        let broker = MockServer::start().await;
+        let mold = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        mock_lock(&broker).await;
+        let input = dir.path().join("in.png");
+        std::fs::write(&input, tiny_png()).unwrap();
+        let mut with_text = png_header(4, 4);
+        with_text.extend_from_slice(&[0, 0, 0, 10]);
+        with_text.extend_from_slice(b"tEXtmold:x\0abc");
+        with_text.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+        with_text.extend_from_slice(b"IEND");
+        with_text.extend_from_slice(&[0, 0, 0, 0]);
+        Mock::given(method("POST"))
+            .and(path("/api/upscale"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "model": "real-esrgan-x4plus:fp16", "tile_size": 256
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "image": {"data": with_text, "format": "png", "width": 4, "height": 4, "index": 0},
+                "upscale_time_ms": 5, "model": "real-esrgan-x4plus:fp16", "scale_factor": 4,
+                "original_width": 1, "original_height": 1
+            })))
+            .expect(1)
+            .mount(&mold)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"name": "real-esrgan-x2plus:fp16", "family": "upscaler", "downloaded": true},
+                {"name": "real-esrgan-x4plus:fp16", "family": "upscaler", "downloaded": true}
+            ])))
+            .mount(&mold)
+            .await;
+        let provider = MoldProvider::new(MoldConfig {
+            broker_url: broker.uri(),
+            mold_url: mold.uri(),
+            api_key: None,
+            output_dir: dir.path().join("out"),
+            model: None,
+        })
+        .unwrap();
+
+        let asset = provider
+            .upscale_image(UpscaleRequest { image: input })
+            .await
+            .unwrap();
+        assert_eq!(
+            asset.warnings,
+            vec!["upscaled with real-esrgan-x4plus:fp16 to 4x4".to_string()]
+        );
+        let written = std::fs::read(&asset.path).unwrap();
+        assert!(!written.windows(4).any(|w| w == b"tEXt"), "{written:?}");
+        mold.verify().await;
+        broker.verify().await;
+    }
+
+    #[test]
+    fn upscale_input_must_be_a_small_enough_png_or_jpeg() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big.png");
+        std::fs::write(&big, png_header(1025, 1024)).unwrap();
+        let err = read_upscale_input(&big).unwrap_err();
+        assert!(matches!(err, VisionError::InvalidRequest(_)), "{err}");
+        assert!(err.to_string().contains("1025x1024"), "{err}");
+
+        let text = dir.path().join("note.png");
+        std::fs::write(&text, b"not an image").unwrap();
+        let err = read_upscale_input(&text).unwrap_err();
+        assert!(err.to_string().contains("not a PNG or JPEG"), "{err}");
+
+        let ok = dir.path().join("ok.png");
+        std::fs::write(&ok, png_header(1024, 1024)).unwrap();
+        assert!(read_upscale_input(&ok).is_ok());
     }
 
     #[test]

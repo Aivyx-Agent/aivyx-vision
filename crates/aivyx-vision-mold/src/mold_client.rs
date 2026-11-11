@@ -22,6 +22,12 @@ use crate::body_limits::{self, CappedBodyError};
 /// chooses to send.
 pub(crate) const MAX_IMAGE_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
+/// `POST /api/upscale` replies with JSON holding the image as an array of
+/// byte values, about three times the PNG's size (2026-11-11 live run: a
+/// 7.8 MB PNG came back as 25 MB). The input is capped at 1 megapixel, so
+/// a 4x result is at most 16 megapixels.
+pub(crate) const MAX_UPSCALE_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
+
 /// `mold serve`'s own error responses are small, hand-written JSON
 /// (`{"error", "code"}`) -- nowhere near large enough to need anything
 /// close to `MAX_IMAGE_RESPONSE_BYTES`.
@@ -70,6 +76,18 @@ pub struct GenerateImageRequest {
     pub strength: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_format: Option<String>,
+    /// Base64-encoded inpainting mask (white = repaint, black = keep);
+    /// mold requires `source_image` with it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mask_image: Option<String>,
+    /// `false` stops mold writing the prompt and settings into the image.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embed_metadata: Option<bool>,
+    /// `false` sends mold's own copy of the result straight to its trash
+    /// (purged after `gallery.trash_retention_days`) instead of its
+    /// gallery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub save_to_gallery: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -235,6 +253,92 @@ impl MoldClient {
             status: 200,
             code: None,
             message: format!("mold serve's model list was not understood: {e}"),
+        })
+    }
+}
+
+/// `POST /api/upscale` (not in mold 0.37's OpenAPI document; shape found
+/// in the 2026-11-11 live run).
+#[derive(Debug, Clone, Serialize)]
+pub struct UpscaleImageRequest {
+    pub model: String,
+    /// Base64-encoded PNG or JPEG.
+    pub image: String,
+    /// Smaller tiles use less GPU memory: the default ran out of memory
+    /// beside a loaded LLM in the live run, 256 did not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tile_size: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpscaleImageResponse {
+    pub bytes: Vec<u8>,
+    pub content_type: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Deserialize)]
+struct UpscaleBody {
+    image: UpscaledImage,
+}
+
+#[derive(Deserialize)]
+struct UpscaledImage {
+    data: Vec<u8>,
+    #[serde(default)]
+    format: String,
+    #[serde(default)]
+    width: u32,
+    #[serde(default)]
+    height: u32,
+}
+
+impl MoldClient {
+    pub async fn upscale(
+        &self,
+        req: UpscaleImageRequest,
+    ) -> Result<UpscaleImageResponse, MoldClientError> {
+        match tokio::time::timeout(self.overall_timeout, self.upscale_inner(req)).await {
+            Ok(result) => result,
+            Err(_) => Err(MoldClientError::Timeout),
+        }
+    }
+
+    async fn upscale_inner(
+        &self,
+        req: UpscaleImageRequest,
+    ) -> Result<UpscaleImageResponse, MoldClientError> {
+        let mut builder = self
+            .http
+            .post(format!("{}/api/upscale", self.base_url))
+            .json(&req);
+        if let Some(key) = &self.api_key {
+            builder = builder.header("X-Api-Key", key);
+        }
+        let response = builder.send().await.map_err(classify_transport_error)?;
+        if !response.status().is_success() {
+            return Err(error_from_response(response).await);
+        }
+        let bytes = body_limits::read_capped_body(response, MAX_UPSCALE_RESPONSE_BYTES)
+            .await
+            .map_err(map_capped_body_error)?;
+        let body: UpscaleBody =
+            serde_json::from_slice(&bytes).map_err(|e| MoldClientError::BackendError {
+                status: 200,
+                code: None,
+                message: format!("mold serve's upscale reply was not understood: {e}"),
+            })?;
+        let content_type = match body.image.format.as_str() {
+            "jpeg" | "jpg" => "image/jpeg",
+            "webp" => "image/webp",
+            _ => "image/png",
+        };
+        Ok(UpscaleImageResponse {
+            bytes: body.image.data,
+            content_type: content_type.to_string(),
+            width: body.image.width,
+            height: body.image.height,
         })
     }
 }

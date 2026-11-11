@@ -79,6 +79,7 @@ fn request(width: u32, height: u32) -> ImageRequest {
         height: Some(height),
         seed: Some(3),
         strength: None,
+        mask_image: None,
         style_hint: None,
     }
 }

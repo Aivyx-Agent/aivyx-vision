@@ -61,6 +61,7 @@ async fn generate_image_ignores_proxy_environment_variables() {
             height: None,
             seed: None,
             strength: None,
+            mask_image: None,
             style_hint: None,
         })
         .await

@@ -18,5 +18,6 @@ mod provider;
 pub use gpu_lock_client::{GpuLockClient, GpuLockClientError, LeaseId};
 pub use mold_client::{
     GenerateImageRequest, GenerateImageResponse, MoldClient, MoldClientError, MoldModel,
+    UpscaleImageRequest, UpscaleImageResponse,
 };
 pub use provider::{MoldConfig, MoldProvider};

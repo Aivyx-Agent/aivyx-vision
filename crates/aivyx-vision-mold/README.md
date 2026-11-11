@@ -81,16 +81,28 @@ fall back to `bin`).
   model's default size and lose the layout. `ImageRequest::strength`
   (0.0 keeps the reference, 1.0 ignores it; mold's default 0.75) is sent
   only with a reference, and dropped with a note without one.
-- **Embedded metadata is removed; mold's own copies are not.** mold
-  writes the prompt and every setting into each image it returns (on by
-  default in its container: `MOLD_EMBED_METADATA=1`). This crate strips
-  that text (PNG `tEXt`/`zTXt`/`iTXt`/`eXIf`/`tIME`; JPEG EXIF, XMP, IPTC
-  and comments) before writing the file, so a shared image doesn't carry
-  its prompt. mold itself still keeps a copy of every image in its
-  gallery (`~/.mold/output`, readable by other users of that machine in
-  the 0.37 container) and the prompts in its database (`~/.mold/mold.db`).
-  An operator who handles private prompts should run mold as its own
-  user with a private home, and clear the gallery as they see fit.
+- **What mold keeps.** mold writes the prompt and every setting into
+  each image (`MOLD_EMBED_METADATA=1` is its container default) and keeps
+  a copy of every result in its gallery. Each request asks for
+  `embed_metadata: false`, and this crate also strips any text that still
+  arrives (PNG `tEXt`/`zTXt`/`iTXt`/`eXIf`/`tIME`; JPEG EXIF, XMP, IPTC and
+  comments) before writing the file. Text-to-image requests also send
+  `save_to_gallery: false`, which moves mold's copy straight to its trash
+  (purged after `gallery.trash_retention_days`, 30 by default).
+  Image-to-image requests don't: with a source image, that flag made mold
+  0.37 log a "source-media handoff failure" on every request and wedge
+  once (2026-11-11 live run). So those results, and every prompt in
+  mold's database (`~/.mold/mold.db`), stay on the mold machine. An
+  operator handling private prompts should run mold as its own user with
+  a private home and lower the trash retention.
+- **Image-to-image and inpainting.** `ImageRequest::mask_image` (white =
+  repaint, black = keep) needs `reference_image`.
+- **Upscaling** (`upscale_image`) goes through mold's standalone
+  `/api/upscale` with `real-esrgan-x4plus` (the x2plus weights fail to
+  load in mold 0.37) and 256-pixel tiles (the default ran out of GPU
+  memory beside a loaded LLM). Inputs are capped at 1 megapixel, since
+  4x makes them 16 times bigger. Asking `/api/generate` for an
+  `upscale_model` hung mold 0.37, so this crate never does.
 - **`mold serve` and `aivyx-broker` are both required-up dependencies**
   for `generate_image` to work at all — if either is down, the call fails
   with `VisionError::BackendUnreachable`, same trust model as this whole
