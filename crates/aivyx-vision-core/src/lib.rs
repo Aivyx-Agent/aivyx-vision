@@ -31,9 +31,17 @@ pub struct ImageRequest {
     /// A local file path to use for image-to-image generation, if the
     /// backend and model support it.
     pub reference_image: Option<PathBuf>,
+    /// Output size. With a reference image and no size, the reference's
+    /// own size is used (and with one side given, the other keeps the
+    /// reference's proportions), so image-to-image keeps the picture's
+    /// shape.
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub seed: Option<u64>,
+    /// How far image-to-image may move away from the reference, from 0.0
+    /// (keep it) to 1.0 (ignore it). `None` uses the backend's default.
+    /// Ignored, with a warning, when there is no reference image.
+    pub strength: Option<f32>,
     /// A free-text style nudge (e.g. "watercolor", "pixel art"). Backends
     /// with no discrete style parameter fold this into the prompt they
     /// actually send.
@@ -106,6 +114,10 @@ pub enum VisionError {
     /// what's wrong.
     #[error("local I/O failed: {0}")]
     Io(String),
+    /// The request itself is invalid (for example, a strength outside
+    /// 0.0..=1.0), whatever backend it goes to.
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
     /// A failure inside this crate or its backend client that is neither
     /// the backend's nor the local filesystem's fault (for example, the
     /// generation task panicked).
@@ -203,6 +215,7 @@ mod tests {
                 width: None,
                 height: None,
                 seed: None,
+                strength: None,
                 style_hint: None,
             })
             .await
@@ -227,6 +240,7 @@ mod tests {
                 width: Some(512),
                 height: Some(512),
                 seed: None,
+                strength: None,
                 style_hint: Some("watercolor".to_string()),
             })
             .await
@@ -248,6 +262,7 @@ mod tests {
                 width: None,
                 height: None,
                 seed: None,
+                strength: None,
                 style_hint: None,
             })
             .await

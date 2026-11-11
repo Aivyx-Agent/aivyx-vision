@@ -60,6 +60,7 @@ async fn generate_image_ignores_proxy_environment_variables() {
             width: None,
             height: None,
             seed: None,
+            strength: None,
             style_hint: None,
         })
         .await

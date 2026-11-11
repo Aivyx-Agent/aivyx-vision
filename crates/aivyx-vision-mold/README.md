@@ -73,7 +73,14 @@ fall back to `bin`).
   image model downloaded on the server is used (video, 3D and other
   families are skipped; with several, the first by name, with a note).
   Unset fields take the model's defaults, and a requested size is rounded
-  to the model's grid (mold refuses others), with a note to the agent.
+  to the model's grid and scaled down to its `max_pixels` (mold refuses
+  others), with a note to the agent.
+- **Image-to-image keeps the reference's shape.** With a reference image
+  and no size, the reference's own size is used (one side given: the
+  other keeps its proportions); mold would otherwise render at the
+  model's default size and lose the layout. `ImageRequest::strength`
+  (0.0 keeps the reference, 1.0 ignores it; mold's default 0.75) is sent
+  only with a reference, and dropped with a note without one.
 - **`mold serve` and `aivyx-broker` are both required-up dependencies**
   for `generate_image` to work at all — if either is down, the call fails
   with `VisionError::BackendUnreachable`, same trust model as this whole

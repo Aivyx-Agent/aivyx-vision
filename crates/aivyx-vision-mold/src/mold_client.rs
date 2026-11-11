@@ -64,6 +64,10 @@ pub struct GenerateImageRequest {
     /// Base64-encoded source image, for image-to-image generation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_image: Option<String>,
+    /// How far image-to-image may move from `source_image`, 0.0 to 1.0
+    /// (mold's default is 0.75).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strength: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_format: Option<String>,
 }
@@ -249,6 +253,9 @@ pub struct MoldModel {
     /// Width and height must be multiples of this; mold refuses others
     /// with a 422 (2026-11-11 live run: 500x500 on flux2).
     pub dimension_alignment: Option<u32>,
+    /// The largest width x height mold accepts for this model; over it is
+    /// a 422 (2026-11-11 live run: 1800000 on flux2-klein).
+    pub max_pixels: Option<u64>,
 }
 
 /// Turns a non-2xx response into a typed error. mold answers most errors

@@ -9,7 +9,9 @@
 //! - sizes off the model's grid are refused (422), not adjusted;
 //! - `UNKNOWN_MODEL` (404) and `UNAUTHORIZED` (401) codes;
 //! - a successful reply carries `x-mold-seed-used` and
-//!   `x-mold-request-warning`.
+//!   `x-mold-request-warning`;
+//! - sizes over the model's `max_pixels` are refused (422), and
+//!   image-to-image takes `strength` (second live run, 2026-11-11).
 //!
 //! Recorded bodies are verbatim except the image itself: the real reply
 //! was a 512x512 PNG; a PNG signature stands in for it.
@@ -21,11 +23,12 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// `GET /api/models`, reduced to the downloaded model's fields this crate
 /// reads (the real list has about 180 entries with many more fields).
-const MODELS: &str = r#"[{"name":"flux2-klein:q8","family":"flux2","downloaded":true,"default_steps":4,"default_width":1024,"default_height":1024,"dimension_alignment":16,"default_guidance":1.0},{"name":"flux-schnell:q8","family":"flux","downloaded":false,"default_steps":4,"default_width":1024,"default_height":1024,"dimension_alignment":16}]"#;
+const MODELS: &str = r#"[{"name":"flux2-klein:q8","family":"flux2","downloaded":true,"default_steps":4,"default_width":1024,"default_height":1024,"dimension_alignment":16,"max_pixels":1800000,"default_guidance":1.0},{"name":"flux-schnell:q8","family":"flux","downloaded":false,"default_steps":4,"default_width":1024,"default_height":1024,"dimension_alignment":16}]"#;
 const WARNING: &str = "512x512 is not a recommended resolution for flux2 models. Suggested: 1024x1024, 1024x768, 768x1024, 1024x576, ... (6 total)";
 const E401: &str = r#"{"error":"invalid API key","code":"UNAUTHORIZED"}"#;
 const E404: &str = r#"{"error":"deferred generation preparation failed: unknown model 'no-such-model:q8'. Run 'mold list' to see available models.","code":"UNKNOWN_MODEL","recovery":{"job_id":"5e9aa8e1-9deb-4b44-9e95-c55e1d9db8a5","batch_id":"ef74a7cc-e640-4551-8c89-180b468a71fe","retryable":true}}"#;
 const E422_MISSING: &str = "Failed to deserialize the JSON body into the target type: missing field `steps` at line 1 column 64";
+const E422_TOO_BIG: &str = r#"{"error":"2048x2048 = 4.19 megapixels exceeds the 1.8MP limit (VAE VRAM constraint)","code":"VALIDATION_ERROR"}"#;
 const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 
 async fn broker() -> MockServer {
@@ -73,6 +76,7 @@ fn request(width: u32, height: u32) -> ImageRequest {
         width: Some(width),
         height: Some(height),
         seed: Some(3),
+        strength: None,
         style_hint: None,
     }
 }
@@ -145,6 +149,40 @@ async fn an_off_grid_size_is_rounded_before_mold_sees_it() {
     mold.verify().await;
 }
 
+/// mold refuses 2048x2048 on flux2 ("exceeds the 1.8MP limit"); the size
+/// is scaled down to fit first, keeping its shape, and the agent is told.
+#[tokio::test]
+async fn a_size_over_the_pixel_limit_is_scaled_before_mold_sees_it() {
+    let broker = broker().await;
+    let mold = mold_with_models().await;
+    Mock::given(method("POST"))
+        .and(path("/api/generate"))
+        .and(body_partial_json(
+            serde_json::json!({"width": 1328, "height": 1328}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(PNG, "image/png"))
+        .expect(1)
+        .mount(&mold)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/generate"))
+        .respond_with(ResponseTemplate::new(422).set_body_raw(E422_TOO_BIG, "application/json"))
+        .mount(&mold)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let asset = provider(&broker, &mold, dir.path())
+        .generate_image(request(2048, 2048))
+        .await
+        .unwrap();
+    assert!(
+        asset.warnings[0].contains("at most 1800000 pixels: generated 1328x1328"),
+        "{:?}",
+        asset.warnings
+    );
+    mold.verify().await;
+}
+
 #[tokio::test]
 async fn molds_recorded_errors_read_clearly() {
     for (status, body, content_type, expect) in [
@@ -160,6 +198,12 @@ async fn molds_recorded_errors_read_clearly() {
             E422_MISSING,
             "text/plain; charset=utf-8",
             "missing field `steps`",
+        ),
+        (
+            422,
+            E422_TOO_BIG,
+            "application/json",
+            "exceeds the 1.8MP limit",
         ),
     ] {
         let broker = broker().await;

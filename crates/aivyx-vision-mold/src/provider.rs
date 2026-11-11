@@ -96,16 +96,18 @@ impl GenerationProvider for MoldProvider {
             // Built (and the reference image read) before the lock is
             // taken: a bad path or an oversized file fails without a broker
             // round trip, and the lock is never held for local file I/O.
-            let mut mold_req = tokio::task::spawn_blocking(move || build_mold_request(&req))
-                .await
-                .map_err(|e| {
-                    VisionError::Internal(format!("reading the reference image: {e}"))
-                })??;
+            let (mut mold_req, mut notes) =
+                tokio::task::spawn_blocking(move || build_mold_request(&req))
+                    .await
+                    .map_err(|e| {
+                        VisionError::Internal(format!("reading the reference image: {e}"))
+                    })??;
             // mold 0.37 requires model, width, height and steps (found in the
             // 2026-11-11 live run); fill whatever the caller left unset from
             // the model's own defaults.
             let models = mold.models().await.map_err(map_mold_error)?;
-            let (chosen, mut notes) = resolve_model(configured_model.as_deref(), &models)?;
+            let (chosen, model_notes) = resolve_model(configured_model.as_deref(), &models)?;
+            notes.extend(model_notes);
             notes.extend(fill_from_model(&mut mold_req, chosen));
 
             let lease = gpu_lock.acquire().await.map_err(map_gpu_lock_error)?;
@@ -252,9 +254,10 @@ fn resolve_model<'a>(
 }
 
 /// Fills the fields mold requires from `model`'s defaults, keeping
-/// whatever the caller set, and rounds a requested size to the model's
-/// `dimension_alignment` (mold refuses anything else). Returns a note for
-/// the agent when it rounded.
+/// whatever the caller set, and fits the size to what mold accepts for the
+/// model: a multiple of its `dimension_alignment`, and no more than its
+/// `max_pixels` (mold refuses anything else). Returns a note for the agent
+/// when the size changed.
 fn fill_from_model(req: &mut GenerateImageRequest, model: &MoldModel) -> Vec<String> {
     req.model.get_or_insert_with(|| model.name.clone());
     if req.steps.is_none() {
@@ -269,12 +272,33 @@ fn fill_from_model(req: &mut GenerateImageRequest, model: &MoldModel) -> Vec<Str
     };
     req.width = fit(req.width, model.default_width);
     req.height = fit(req.height, model.default_height);
+    let show = |v: Option<u32>| v.map_or("default".to_string(), |v| v.to_string());
+
+    if let (Some(w), Some(h), Some(max)) = (req.width, req.height, model.max_pixels)
+        && u64::from(w) * u64::from(h) > max
+    {
+        // Scale both sides by the same factor, then round down to the grid,
+        // so the result keeps the shape and stays under the limit.
+        let scale = (max as f64 / (f64::from(w) * f64::from(h))).sqrt();
+        let a = align.unwrap_or(1);
+        let down = |v: u32| (((f64::from(v) * scale) as u32) / a).max(1) * a;
+        req.width = Some(down(w));
+        req.height = Some(down(h));
+        return vec![format!(
+            "{} allows at most {max} pixels: generated {}x{} instead of {}x{}",
+            model.name,
+            show(req.width),
+            show(req.height),
+            show(asked.0.or(Some(w))),
+            show(asked.1.or(Some(h))),
+        )];
+    }
+
     let rounded_width = asked.0.is_some() && asked.0 != req.width;
     let rounded_height = asked.1.is_some() && asked.1 != req.height;
     if !rounded_width && !rounded_height {
         return Vec::new();
     }
-    let show = |v: Option<u32>| v.map_or("default".to_string(), |v| v.to_string());
     vec![format!(
         "{} needs sizes in multiples of {}: generated {}x{} instead of the requested {}x{}",
         model.name,
@@ -286,26 +310,86 @@ fn fill_from_model(req: &mut GenerateImageRequest, model: &MoldModel) -> Vec<Str
     )]
 }
 
-fn build_mold_request(req: &ImageRequest) -> Result<GenerateImageRequest, VisionError> {
+/// Turns the backend-agnostic request into mold's, with any note for the
+/// agent. With a reference image, a missing size comes from the reference
+/// so the result keeps the picture's shape: mold otherwise renders at the
+/// model's default size (2026-11-11 live run: a 1024x768 reference came
+/// back 1024x1024 with its layout lost).
+fn build_mold_request(
+    req: &ImageRequest,
+) -> Result<(GenerateImageRequest, Vec<String>), VisionError> {
+    let mut notes = Vec::new();
+    if let Some(strength) = req.strength
+        && !(0.0..=1.0).contains(&strength)
+    {
+        return Err(VisionError::InvalidRequest(format!(
+            "strength must be between 0.0 and 1.0, got {strength}"
+        )));
+    }
     let prompt = match &req.style_hint {
         Some(hint) => format!("{}, {hint}", req.prompt),
         None => req.prompt.clone(),
     };
+    let (mut width, mut height) = (req.width, req.height);
+    let mut strength = req.strength;
     let source_image = match &req.reference_image {
         Some(path) => {
             let bytes = read_reference_image(path)?;
+            if width.is_none() || height.is_none() {
+                match imagesize::blob_size(&bytes) {
+                    Ok(size) if size.width > 0 && size.height > 0 => {
+                        (width, height) = size_from_reference(
+                            (width, height),
+                            (size.width as u64, size.height as u64),
+                        );
+                    }
+                    _ => notes.push(
+                        "couldn't read the reference image's size; used the model's default \
+                         size, so the result may be a different shape"
+                            .to_string(),
+                    ),
+                }
+            }
             Some(base64::engine::general_purpose::STANDARD.encode(bytes))
         }
-        None => None,
+        None => {
+            if strength.take().is_some() {
+                notes.push(
+                    "strength only applies to image-to-image (with a reference image); ignored"
+                        .to_string(),
+                );
+            }
+            None
+        }
     };
-    Ok(GenerateImageRequest {
-        prompt,
-        width: req.width,
-        height: req.height,
-        seed: req.seed,
-        source_image,
-        ..Default::default()
-    })
+    Ok((
+        GenerateImageRequest {
+            prompt,
+            width,
+            height,
+            seed: req.seed,
+            source_image,
+            strength,
+            ..Default::default()
+        },
+        notes,
+    ))
+}
+
+/// Fills a missing width or height from the reference image's size: both
+/// when neither is set, otherwise the missing side in the reference's
+/// proportions.
+fn size_from_reference(
+    asked: (Option<u32>, Option<u32>),
+    (ref_w, ref_h): (u64, u64),
+) -> (Option<u32>, Option<u32>) {
+    let clamp = |v: u64| u32::try_from(v.max(1)).unwrap_or(u32::MAX);
+    match asked {
+        (None, None) => (Some(clamp(ref_w)), Some(clamp(ref_h))),
+        (Some(w), None) => (Some(w), Some(clamp(u64::from(w) * ref_h / ref_w))),
+        (None, Some(h)) => (Some(clamp(u64::from(h) * ref_w / ref_h)), Some(h)),
+        both => both,
+    }
 }
 
 /// Writes the image as a new file only its owner can read: generated images
@@ -496,6 +580,7 @@ mod tests {
             width: None,
             height: None,
             seed: None,
+            strength: None,
             style_hint: None,
         }
     }
@@ -648,7 +733,7 @@ mod tests {
             style_hint: Some("watercolor".to_string()),
             ..sample_image_request()
         };
-        let mold_req = build_mold_request(&req).unwrap();
+        let (mold_req, _) = build_mold_request(&req).unwrap();
         assert_eq!(mold_req.prompt, "a mountain, watercolor");
     }
 
@@ -663,11 +748,127 @@ mod tests {
             reference_image: Some(image_path),
             ..sample_image_request()
         };
-        let mold_req = build_mold_request(&req).unwrap();
+        let (mold_req, _) = build_mold_request(&req).unwrap();
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(mold_req.source_image.unwrap())
             .unwrap();
         assert_eq!(decoded, vec![1, 2, 3, 4]);
+    }
+
+    /// The start of a PNG: enough for its size to be read.
+    fn png_header(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13];
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&[8, 2, 0, 0, 0, 0, 0, 0, 0]);
+        bytes
+    }
+
+    fn reference_request(dir: &Path, width: u32, height: u32) -> ImageRequest {
+        let image_path = dir.join("ref.png");
+        std::fs::write(&image_path, png_header(width, height)).unwrap();
+        ImageRequest {
+            prompt: "the same scene at night".to_string(),
+            reference_image: Some(image_path),
+            ..sample_image_request()
+        }
+    }
+
+    /// 2026-11-11 live run: a 1024x768 reference with no size came back
+    /// 1024x1024 (the model's default) and lost the picture's layout.
+    #[test]
+    fn build_mold_request_takes_the_size_from_the_reference_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mold_req, notes) =
+            build_mold_request(&reference_request(dir.path(), 1024, 768)).unwrap();
+        assert_eq!((mold_req.width, mold_req.height), (Some(1024), Some(768)));
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    #[test]
+    fn build_mold_request_keeps_the_reference_proportions_when_one_side_is_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = ImageRequest {
+            width: Some(600),
+            ..reference_request(dir.path(), 1200, 800)
+        };
+        let (mold_req, _) = build_mold_request(&req).unwrap();
+        assert_eq!((mold_req.width, mold_req.height), (Some(600), Some(400)));
+
+        let req = ImageRequest {
+            height: Some(400),
+            ..reference_request(dir.path(), 1200, 800)
+        };
+        let (mold_req, _) = build_mold_request(&req).unwrap();
+        assert_eq!((mold_req.width, mold_req.height), (Some(600), Some(400)));
+    }
+
+    #[test]
+    fn build_mold_request_keeps_an_explicit_size_with_a_reference_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = ImageRequest {
+            width: Some(512),
+            height: Some(512),
+            ..reference_request(dir.path(), 1024, 768)
+        };
+        let (mold_req, _) = build_mold_request(&req).unwrap();
+        assert_eq!((mold_req.width, mold_req.height), (Some(512), Some(512)));
+    }
+
+    #[test]
+    fn build_mold_request_notes_a_reference_image_whose_size_cannot_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let image_path = dir.path().join("ref.png");
+        std::fs::write(&image_path, [1u8, 2, 3, 4]).unwrap();
+        let req = ImageRequest {
+            reference_image: Some(image_path),
+            ..sample_image_request()
+        };
+        let (mold_req, notes) = build_mold_request(&req).unwrap();
+        assert_eq!((mold_req.width, mold_req.height), (None, None));
+        assert!(
+            notes[0].contains("couldn't read the reference image's size"),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn build_mold_request_passes_strength_with_a_reference_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = ImageRequest {
+            strength: Some(0.9),
+            ..reference_request(dir.path(), 1024, 768)
+        };
+        let (mold_req, notes) = build_mold_request(&req).unwrap();
+        assert_eq!(mold_req.strength, Some(0.9));
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    #[test]
+    fn build_mold_request_drops_strength_without_a_reference_image_and_says_so() {
+        let req = ImageRequest {
+            strength: Some(0.5),
+            ..sample_image_request()
+        };
+        let (mold_req, notes) = build_mold_request(&req).unwrap();
+        assert_eq!(mold_req.strength, None);
+        assert!(notes[0].contains("strength"), "{notes:?}");
+    }
+
+    #[test]
+    fn build_mold_request_refuses_a_strength_outside_zero_to_one() {
+        for strength in [-0.1, 1.5, f32::NAN] {
+            let req = ImageRequest {
+                strength: Some(strength),
+                ..sample_image_request()
+            };
+            let err = build_mold_request(&req).unwrap_err();
+            assert!(
+                matches!(err, VisionError::InvalidRequest(_)),
+                "{strength}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -814,6 +1015,7 @@ mod tests {
             default_width: Some(1024),
             default_height: Some(768),
             dimension_alignment: Some(16),
+            max_pixels: Some(1_800_000),
         }
     }
 
@@ -900,6 +1102,44 @@ mod tests {
             notes[0].contains("generated 496x496 instead of the requested 500x500"),
             "{notes:?}"
         );
+    }
+
+    /// mold refuses anything over the model's pixel limit (2026-11-11 live
+    /// run: 2048x2048 on flux2 was a 422, "exceeds the 1.8MP limit"), and
+    /// a phone photo as a reference would be far over it.
+    #[test]
+    fn fill_from_model_scales_a_size_over_the_pixel_limit_down_and_says_so() {
+        let mut req = GenerateImageRequest {
+            prompt: "x".to_string(),
+            width: Some(4032),
+            height: Some(3024),
+            ..Default::default()
+        };
+        let notes = fill_from_model(&mut req, &model("flux2-klein:q8", "flux2", true));
+        assert_eq!((req.width, req.height), (Some(1536), Some(1152)));
+        assert!(
+            notes[0].contains("at most 1800000 pixels: generated 1536x1152 instead of 4032x3024"),
+            "{notes:?}"
+        );
+    }
+
+    /// Rounding to the grid alone can tip a size over the limit.
+    #[test]
+    fn fill_from_model_never_rounds_past_the_pixel_limit() {
+        let model = MoldModel {
+            max_pixels: Some(1000 * 1000),
+            ..model("m", "flux2", true)
+        };
+        let mut req = GenerateImageRequest {
+            prompt: "x".to_string(),
+            width: Some(1000),
+            height: Some(1000),
+            ..Default::default()
+        };
+        fill_from_model(&mut req, &model);
+        let (w, h) = (req.width.unwrap(), req.height.unwrap());
+        assert!(w * h <= 1000 * 1000, "{w}x{h}");
+        assert_eq!((w % 16, h % 16), (0, 0));
     }
 
     /// The fields mold 0.37 requires (model, width, height, steps) reach it.
