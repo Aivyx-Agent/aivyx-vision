@@ -190,6 +190,9 @@ impl MoldClient {
         &self,
         req: GenerateImageRequest,
     ) -> Result<GenerateImageResponse, MoldClientError> {
+        crate::locality::ensure_local(&self.base_url)
+            .await
+            .map_err(MoldClientError::Transport)?;
         let mut builder = self
             .http
             .post(format!("{}/api/generate", self.base_url))
@@ -260,6 +263,9 @@ impl MoldClient {
     }
 
     async fn models_inner(&self) -> Result<Vec<MoldModel>, MoldClientError> {
+        crate::locality::ensure_local(&self.base_url)
+            .await
+            .map_err(MoldClientError::Transport)?;
         let mut builder = self.http.get(format!("{}/api/models", self.base_url));
         if let Some(key) = &self.api_key {
             builder = builder.header("X-Api-Key", key);
@@ -340,6 +346,9 @@ impl MoldClient {
         &self,
         req: UpscaleImageRequest,
     ) -> Result<UpscaleImageResponse, MoldClientError> {
+        crate::locality::ensure_local(&self.base_url)
+            .await
+            .map_err(MoldClientError::Transport)?;
         let mut builder = self
             .http
             .post(format!("{}/api/upscale", self.base_url))

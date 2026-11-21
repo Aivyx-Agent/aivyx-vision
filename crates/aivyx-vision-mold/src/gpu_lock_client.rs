@@ -126,6 +126,9 @@ impl GpuLockClient {
     }
 
     async fn acquire_inner(&self) -> Result<LeaseId, GpuLockClientError> {
+        crate::locality::ensure_local(&self.broker_url)
+            .await
+            .map_err(GpuLockClientError::Transport)?;
         let response = self
             .http
             .post(format!("{}/gpu-lock/acquire", self.broker_url))
@@ -185,6 +188,9 @@ impl GpuLockClient {
     }
 
     async fn release_inner(&self, lease: &LeaseId) -> Result<(), GpuLockClientError> {
+        crate::locality::ensure_local(&self.broker_url)
+            .await
+            .map_err(GpuLockClientError::Transport)?;
         #[derive(Serialize)]
         struct ReleaseRequest<'a> {
             lease_id: &'a str,

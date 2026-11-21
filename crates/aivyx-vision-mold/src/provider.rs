@@ -11,11 +11,13 @@
 //! guard would have been the wrong fix.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use aivyx_vision_core::{
     GeneratedAsset, GenerationProvider, ImageRequest, ThreeDRequest, UpscaleRequest, VisionError,
 };
+use aivyx_route::discovery::LocalOnlyDns;
 use async_trait::async_trait;
 use base64::Engine;
 
@@ -269,8 +271,13 @@ impl GenerationProvider for MoldProvider {
 /// services, and reqwest otherwise sends even loopback requests -- with the
 /// prompt, the API key and any reference image -- to `HTTP_PROXY` /
 /// `ALL_PROXY` when one is set (audit 2026-11-11 X1).
+///
+/// `LocalOnlyDns` refuses, at connect time, a name that resolves to a public
+/// address; IP-literal URLs skip the resolver, so each request is also
+/// checked by `locality::ensure_local`.
 fn build_http_client() -> Result<reqwest::Client, VisionError> {
     reqwest::Client::builder()
+        .dns_resolver(Arc::new(LocalOnlyDns))
         .connect_timeout(Duration::from_secs(5))
         .read_timeout(MOLD_READ_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
@@ -849,6 +856,46 @@ mod tests {
             mask_image: None,
             style_hint: None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_public_ip_literal_mold_url_is_refused_before_any_request() {
+        let broker = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MoldProvider::new(MoldConfig {
+            broker_url: broker.uri(),
+            mold_url: "http://203.0.113.7:7680".to_string(),
+            api_key: None,
+            output_dir: dir.path().to_path_buf(),
+            model: None,
+        })
+        .unwrap();
+        let err = provider.generate_image(sample_image_request()).await.unwrap_err();
+        assert!(matches!(err, VisionError::BackendUnreachable(_)), "{err:?}");
+        assert!(err.to_string().contains("is not local"), "{err}");
+        // The broker was never asked for a lease either.
+        assert!(broker.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_public_ip_literal_broker_url_is_refused() {
+        let client = GpuLockClient::new(build_http_client().unwrap(), "http://203.0.113.7:7681".into());
+        let err = client.acquire().await.unwrap_err();
+        assert!(err.to_string().contains("is not local"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_cloud_host_is_refused_at_connect_time_by_the_dns_guard() {
+        // Bypass the per-request check by calling reqwest directly: the
+        // client's own resolver must still refuse, with no lookup.
+        let err = build_http_client()
+            .unwrap()
+            .get("http://api.openai.com:7680/api/models")
+            .send()
+            .await
+            .unwrap_err();
+        let text = format!("{err:?}");
+        assert!(text.contains("NotLocal") && text.contains("CloudHost"), "{text}");
     }
 
     #[tokio::test]
