@@ -18,6 +18,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "aivyx-route"
+version = "0.2.0"
+source = "git+https://github.com/Aivyx-Agent/aivyx-route?rev=fd56957a2c3b061d1045673b67b0dd36380a4044#fd56957a2c3b061d1045673b67b0dd36380a4044"
+dependencies = [
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "aivyx-vision-core"
 version = "0.1.0"
 dependencies = [
@@ -28,8 +41,9 @@ dependencies = [
 
 [[package]]
 name = "aivyx-vision-mold"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
+ "aivyx-route",
  "aivyx-vision-core",
  "async-trait",
  "base64 0.22.1",
