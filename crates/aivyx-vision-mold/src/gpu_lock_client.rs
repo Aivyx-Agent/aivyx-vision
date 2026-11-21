@@ -100,6 +100,10 @@ fn classify_transport_error(e: reqwest::Error) -> GpuLockClientError {
 }
 
 impl GpuLockClient {
+    /// The connect-time local-only DNS guard applies only to clients built by
+    /// `MoldProvider`; the per-request local-only check always applies. A
+    /// caller passing its own `http` client must set `LocalOnlyDns` as the
+    /// resolver, `no_proxy()`, and `redirect(Policy::none())` itself.
     pub fn new(http: reqwest::Client, broker_url: String) -> Self {
         Self {
             http,

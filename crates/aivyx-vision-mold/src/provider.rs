@@ -14,10 +14,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use aivyx_route::discovery::LocalOnlyDns;
 use aivyx_vision_core::{
     GeneratedAsset, GenerationProvider, ImageRequest, ThreeDRequest, UpscaleRequest, VisionError,
 };
-use aivyx_route::discovery::LocalOnlyDns;
 use async_trait::async_trait;
 use base64::Engine;
 
@@ -870,7 +870,10 @@ mod tests {
             model: None,
         })
         .unwrap();
-        let err = provider.generate_image(sample_image_request()).await.unwrap_err();
+        let err = provider
+            .generate_image(sample_image_request())
+            .await
+            .unwrap_err();
         assert!(matches!(err, VisionError::BackendUnreachable(_)), "{err:?}");
         assert!(err.to_string().contains("is not local"), "{err}");
         // The broker was never asked for a lease either.
@@ -879,7 +882,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_public_ip_literal_broker_url_is_refused() {
-        let client = GpuLockClient::new(build_http_client().unwrap(), "http://203.0.113.7:7681".into());
+        let client = GpuLockClient::new(
+            build_http_client().unwrap(),
+            "http://203.0.113.7:7681".into(),
+        );
         let err = client.acquire().await.unwrap_err();
         assert!(err.to_string().contains("is not local"), "{err}");
     }
@@ -895,7 +901,10 @@ mod tests {
             .await
             .unwrap_err();
         let text = format!("{err:?}");
-        assert!(text.contains("NotLocal") && text.contains("CloudHost"), "{text}");
+        assert!(
+            text.contains("NotLocal") && text.contains("CloudHost"),
+            "{text}"
+        );
     }
 
     #[tokio::test]
