@@ -1,5 +1,7 @@
 # Changelog
 
+- mold: pins aivyx-route 0.3.1 (a mapped multicast address now gets the right refusal reason). No behaviour change.
+
 ## aivyx-vision-mold (unreleased version, main)
 
 - Pins aivyx-route 0.3.0 (the "shared" tier); builds `LocalOnlyDns`
