@@ -19,8 +19,8 @@ dependencies = [
 
 [[package]]
 name = "aivyx-route"
-version = "0.2.0"
-source = "git+https://github.com/Aivyx-Agent/aivyx-route?rev=fd56957a2c3b061d1045673b67b0dd36380a4044#fd56957a2c3b061d1045673b67b0dd36380a4044"
+version = "0.3.0"
+source = "git+https://github.com/Aivyx-Agent/aivyx-route?rev=decf3b8fe803757b75170376c17281c3f5cb60f3#decf3b8fe803757b75170376c17281c3f5cb60f3"
 dependencies = [
  "futures-util",
  "reqwest",

@@ -1,5 +1,10 @@
 # Changelog
 
+## aivyx-vision-mold (unreleased version, main)
+
+- Pins aivyx-route 0.3.0 (the "shared" tier); builds `LocalOnlyDns`
+  with `LocalOnlyDns::new()`. No behaviour change.
+
 ## aivyx-vision-mold 0.1.1
 
 - Local-only: the mold and broker HTTP client now uses aivyx-route's

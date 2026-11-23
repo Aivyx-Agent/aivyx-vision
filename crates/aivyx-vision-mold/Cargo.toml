@@ -7,7 +7,7 @@ license = "BUSL-1.1"
 publish = false
 
 [dependencies]
-aivyx-route = { git = "https://github.com/Aivyx-Agent/aivyx-route", rev = "fd56957a2c3b061d1045673b67b0dd36380a4044", features = ["discovery"] }
+aivyx-route = { git = "https://github.com/Aivyx-Agent/aivyx-route", rev = "decf3b8fe803757b75170376c17281c3f5cb60f3", features = ["discovery"] }
 aivyx-vision-core = { path = "../aivyx-vision-core" }
 async-trait = "0.1.89"
 base64 = "0.22"
