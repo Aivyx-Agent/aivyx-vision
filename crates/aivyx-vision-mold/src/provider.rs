@@ -277,7 +277,7 @@ impl GenerationProvider for MoldProvider {
 /// checked by `locality::ensure_local`.
 fn build_http_client() -> Result<reqwest::Client, VisionError> {
     reqwest::Client::builder()
-        .dns_resolver(Arc::new(LocalOnlyDns))
+        .dns_resolver(Arc::new(LocalOnlyDns::new()))
         .connect_timeout(Duration::from_secs(5))
         .read_timeout(MOLD_READ_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
